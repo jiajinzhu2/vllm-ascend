@@ -1,4 +1,5 @@
 import vllm
+import vllm.v1.worker.utils as worker_utils
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
@@ -16,4 +17,5 @@ def _get_ascend_sfa_indexer_backend(_self):
 DeepseekV32IndexerCache.get_attn_backend = _get_ascend_sfa_indexer_backend
 vllm.v1.worker.gpu.attn_utils._allocate_kv_cache = _allocate_kv_cache
 vllm.v1.worker.gpu.attn_utils._reshape_kv_cache = _reshape_kv_cache_v2
+vllm.v1.worker.gpu.attn_utils.bind_kv_cache = worker_utils.bind_kv_cache
 vllm.v1.worker.gpu.model_runner.get_kv_cache_spec = get_kv_cache_spec
