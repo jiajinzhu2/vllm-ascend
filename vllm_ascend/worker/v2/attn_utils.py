@@ -49,7 +49,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
 )
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.utils import calc_split_factor, vllm_version_is
+from vllm_ascend.utils import calc_split_factor
 
 _ATTENTION_MASK_BUILDER = None
 
@@ -145,7 +145,7 @@ def build_attn_metadata(
     if seq_lens_np is None:
         seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
-    if not vllm_version_is("0.25.1") and seq_lens_cpu_upper_bound is None:
+    if seq_lens_cpu_upper_bound is None:
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
     attn_metadata: dict[str, Any] = {}
