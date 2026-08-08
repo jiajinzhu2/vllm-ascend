@@ -77,8 +77,11 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # then we don't need to # copy `execute_model` method in `NPUModelRunner` class.
         self.model_runner = model_runner
         self.update_stream: torch.npu.Stream | None = None
+        self.update_event: torch.npu.Event | None = None
         if cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
+            self.update_event = torch.npu.Event()
+            self.update_event.record(torch.npu.current_stream())
         # The attention backend keys its per-size graph params by the actual
         # captured token counts (rounded up to decode_query_len when using
         # speculative decoding), so derive them from the capture descriptors
@@ -94,8 +97,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
-        self.update_stream.wait_stream(torch.npu.current_stream())
+        assert self.update_event is not None
+        self.update_event.wait(self.update_stream)
         ret = super().run_fullgraph(desc)
+        self.update_event.record(torch.npu.current_stream())
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.

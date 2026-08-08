@@ -7,7 +7,6 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
-from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -54,6 +53,12 @@ class EagleAclGraphManager(SpeculatorCudaGraphManager):
         # when call `run_fullgraph` method in CudaGraphManager,
         # then we don't need to # copy `propose` method in `AscendEagleSpeculator` class.
         self.speculator: Any = None
+        self.update_stream: torch.npu.Stream | None = None
+        self.update_event: torch.npu.Event | None = None
+        if cudagraph_mode.has_full_cudagraphs():
+            self.update_stream = torch.npu.Stream()
+            self.update_event = torch.npu.Event()
+            self.update_event.record(torch.npu.current_stream())
         # The attention backend keys its per-size graph params by the actual
         # captured token counts (rounded up to decode_query_len when using
         # speculative decoding), so derive them from the capture descriptors
@@ -146,15 +151,13 @@ class EagleAclGraphManager(SpeculatorCudaGraphManager):
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
-        if self.is_draft_model_prefill:
-            logger.info_once("PrefillEagleAclGraphManager: draft prefill run_fullgraph with num_tokens=%s", num_tokens)
-        else:
-            logger.info_once("DecodeEagleAclGraphManager: draft run_fullgraph with num_tokens=%s", num_tokens)
-
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(desc.num_reqs, self.is_draft_model_prefill)
 
+        assert self.update_stream is not None
+        assert self.update_event is not None
+        self.update_event.wait(self.update_stream)
         ret = super().run_fullgraph(desc)
-
+        self.update_event.record(torch.npu.current_stream())
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
         num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
@@ -177,7 +180,7 @@ class EagleAclGraphManager(SpeculatorCudaGraphManager):
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 list(self.speculator.attn_backends.values())[0],
-                self.speculator.update_stream,
+                self.update_stream,
                 forward_context,
                 num_tokens,
                 self.vllm_config,
