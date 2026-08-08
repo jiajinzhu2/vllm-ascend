@@ -105,11 +105,6 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                 for _ in range(self.num_speculative_steps - 1)
             ]
 
-        # we need to update full graph params in run_fullgraph,
-        # so create a stream to update full graph params.
-        if cudagraph_mode.has_full_cudagraphs():
-            self.update_stream: torch.npu.Stream = torch.npu.Stream()
-
         # when in decode phase of eagle speculator, we need some value in
         # draft model's input_batch. so we keep a reference here.
         self.input_batch: InputBatch | None = None

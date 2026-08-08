@@ -42,6 +42,12 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # It is set by AscendDFlashSpeculator.init_cudagraph_manager after creation,
         # because upstream's init_cudagraph_manager creates the manager without it.
         self.speculator = speculator
+        self.update_stream: torch.npu.Stream | None = None
+        self.update_event: torch.npu.Event | None = None
+        if cudagraph_mode.has_full_cudagraphs():
+            self.update_stream = torch.npu.Stream()
+            self.update_event = torch.npu.Event()
+            self.update_event.record(torch.npu.current_stream())
         # The attention backend keys its per-size graph params by the actual
         # captured token counts (rounded up to decode_query_len when using
         # speculative decoding), so derive them from the capture descriptors
@@ -87,7 +93,11 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
 
+        assert self.update_stream is not None
+        assert self.update_event is not None
+        self.update_event.wait(self.update_stream)
         ret = super().run_fullgraph(desc)
+        self.update_event.record(torch.npu.current_stream())
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.
@@ -112,7 +122,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             update_full_graph_params(
                 # FIXME(Ronald1995): support hybrid attn backend
                 list(self.speculator.attn_backends.values())[0],
-                self.speculator.update_stream,
+                self.update_stream,
                 forward_context,
                 num_tokens,
                 self.vllm_config,
