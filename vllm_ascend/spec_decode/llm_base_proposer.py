@@ -1168,9 +1168,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         num_indices = token_indices_to_sample.shape[0]
         if lmhead_tp_enable():
-            max_num_reqs_across_dp = (
-                self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+            # DSpark produces K sampling positions per request, while the
+            # target runner uses K + 1 decode query tokens. LMHead TP requires
+            # the same padded row count on every rank, so use the draft-side
+            # width for DSpark instead of the target-side query width.
+            num_indices_per_req = (
+                self.num_speculative_tokens if self.method == "dspark" else self.runner.uniform_decode_query_len
             )
+            max_num_reqs_across_dp = self.vllm_config.scheduler_config.max_num_seqs * num_indices_per_req
             # It is necessary to evaluate the case where num_indices becomes large
             # in the context of the dummy‑run accompaniment of p‑eagle.
             if num_indices > max_num_reqs_across_dp:
@@ -1255,6 +1260,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 raw_logits = self.model.compute_logits(sample_hidden_states)
                 logits = raw_logits.view(-1, self.num_speculative_tokens, raw_logits.shape[-1])
+                if lmhead_tp_enable():
+                    # Keep the padded shape through the LMHead TP collective,
+                    # then remove dummy request blocks before Markov decoding.
+                    logits = logits[: num_indices // self.num_speculative_tokens]
                 num_blk = logits.shape[0]
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
