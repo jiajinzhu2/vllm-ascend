@@ -1,13 +1,45 @@
 from types import SimpleNamespace
 
+import torch
 from torch import nn
 
+from vllm_ascend.models.deepseek_v4 import dspark as deepseek_v4_dspark
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4
 
 
 class StubModule(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
+
+
+def test_dspark_markov_head_uses_replicated_projection(monkeypatch):
+    linear_kwargs = {}
+
+    class StubReplicatedLinear(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            linear_kwargs.update(input_size=input_size, output_size=output_size, **kwargs)
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
+            self.output_size = output_size
+
+        def forward(self, hidden_states):
+            return hidden_states.new_zeros((*hidden_states.shape[:-1], self.output_size))
+
+    monkeypatch.setattr(deepseek_v4_dspark, "ReplicatedLinear", StubReplicatedLinear)
+    config = SimpleNamespace(vocab_size=32, dspark_markov_rank=4)
+
+    head = deepseek_v4_dspark.DSparkMarkovHead(config, "model.layers.3.markov_head")
+
+    assert isinstance(head.markov_w1, nn.Embedding)
+    assert linear_kwargs == {
+        "input_size": 4,
+        "output_size": 32,
+        "bias": False,
+        "return_bias": False,
+        "prefix": "model.layers.3.markov_head.markov_w2",
+    }
+    assert "markov_w2.weight" in dict(head.named_parameters())
+    assert head.bias(torch.zeros(2, 4)).shape == (2, 32)
 
 
 def test_routed_moe_receives_configured_swiglu_limit(monkeypatch):

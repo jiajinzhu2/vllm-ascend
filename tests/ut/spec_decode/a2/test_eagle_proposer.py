@@ -2594,6 +2594,46 @@ class TestRunMergedDraft(TestBase):
         )
         self.assertEqual(draft_token_ids.tolist(), [[151667], [32313]])
 
+    def test_run_merged_draft_dspark_lmhead_tp_uses_draft_width(self):
+        self.proposer.method = "dspark"
+        self.proposer.num_speculative_tokens = 5
+        self.proposer.parallel_drafting = True
+        self.proposer.pass_hidden_states_to_model = False
+        self.proposer.runner.uniform_decode_query_len = 6
+        self.proposer.model = MockDraftModel(returns_tuple=False, vocab_size=64)
+        self.proposer.model.markov_embed = lambda token_ids: torch.zeros((token_ids.shape[0], 1))
+        self.proposer.model.markov_bias = lambda embeddings: torch.zeros((embeddings.shape[0], 64))
+        self.proposer._context_slot_mapping_buffers = MagicMock()
+        self.proposer.build_model_inputs_first_pass = MagicMock()
+        self.proposer._dspark_draft_buffer = torch.zeros((8, 6), dtype=torch.int64)
+        self.proposer._dspark_seed_buffer = torch.zeros(8, dtype=torch.int64)
+        self.proposer.dynamic_spec = None
+        self.proposer.input_ids[:5] = torch.arange(1, 6, dtype=torch.int32)
+
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.enable_reduce_sample = False
+        with (
+            patch.object(llm_base_proposer, "lmhead_tp_enable", return_value=True),
+            patch.object(llm_base_proposer, "get_ascend_config", return_value=mock_ascend_config),
+        ):
+            draft_token_ids = self.proposer._run_merged_draft(
+                num_input_tokens=5,
+                batch_size=1,
+                token_indices_to_sample=torch.arange(5, dtype=torch.int64),
+                target_positions=self.proposer.positions[:5],
+                inputs_embeds=None,
+                multi_steps_attn_metadata=None,
+                num_tokens=5,
+                is_prefill=False,
+            )
+
+        # LMHead TP sees a DP-uniform [max_num_seqs * K] batch, not the
+        # target runner's [max_num_seqs * (K + 1)] decode-query batch.
+        self.assertEqual(self.proposer.model.logit_inputs[0].shape[0], 8 * 5)
+        # The Markov loop only sees the one real request after the collective.
+        self.assertEqual(draft_token_ids.shape, (1, 5))
+        self.assertEqual(draft_token_ids.tolist(), [[1, 2, 3, 4, 5]])
+
     def test_run_merged_draft_mtp_mrope_graph_and_lmhead_tp_preparation(self):
         self.proposer.method = "mtp"
         self.proposer.uses_mrope = True
