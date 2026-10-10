@@ -132,6 +132,7 @@ MSA 计算与稀疏选择接口保持现有实现。本次对主模型增加的�
 | 文件 | 改动 | 目的 |
 | --- | --- | --- |
 | `vllm_ascend/attention/dspark_fa3.py` | 新增草稿 GQA 后端、设备长度 metadata builder 和算子适配 | 支持标准 SWA / 非因果，并调用 AICPU metadata |
+| `vllm_ascend/attention/attention_v1.py` | 后端已写入原 output 时跳过父类复制 | 删除每层重复的 output 自复制，保留独立结果的写回 |
 | `vllm_ascend/platform.py` | 新增 DSpark 草稿专用选择和能力检查 | 只在显式配置时启用，排除不支持的输入 |
 | `vllm_ascend/device/hardware_profile.py` | 为 A3 声明外部 metadata 接口能力 | 不将 A3 适配默认扩展到其他硬件 |
 | `vllm_ascend/models/minimax_m3/minimax_m3.py` | 辅助特征启用条件加入 DSpark | 补齐 MSA 主模型到 GQA 草稿的输入链路 |
@@ -296,19 +297,22 @@ MRV2 原有初始化会统计全部 attention group 的图能力，新后端的 
 - CPU 上界含有拒绝 token 时仍使用设备有效长度；
 - 自定义 scale 与 metadata 指纹一致；
 - 只处理真实 query token，保留输出 padding；
+- builder 无需 CPU query 镜像，兼容字段复用同一设备视图；
+- 公共 forward 对原地输出和独立结果都只执行一次必要的 `copy_`；
 - 连续缓存与 page padding，K/V 不重叠且共享原始存储；
 - 相同层参数复用、不同参数隔离、下一步重新生成；
 - M3 采集带 residual 的辅助特征，后续 residual 修改不影响采集结果。
 - M3 fallback 提供 DSpark 公共模块需要的导入符号。
 
-实际运行结果为 **274 passed，14 个现有 TorchScript 弃用提示**。
+实际运行结果为 **317 passed，14 个现有 TorchScript 弃用提示**。
 运行范围包括新后端与 M3 辅助特征用例，以及现有 M3、硬件能力、MRV2
-attention / cache、DSpark speculator 和 graph contract 回归，共 8 个文件。
+attention / cache、DSpark speculator 和 graph contract 回归，共 9 个文件。
+本轮还运行了公共 `attention_v1` 的现有回归用例。
 
 当前源码 checkout 未生成原生 `_build_info`，本地 CPU 验证在 pytest
 启动前注入 A2 build 标识并禁用 Torch NPU 自动加载，再使用仓库现有 CPU
 mock fixture。该启动辅助脚本不包含在 PR 中，也不替换 attention 算子的
-数值实现。完整日志保存在本地 `dspark-fa3-mrv2-validation.log`。
+数值实现。完整日志保存在本地 `dspark-fa3-mrv2-cleanup-validation.log`。
 
 CPU 验证环境记录：Python 3.11、Torch 2.10.0、torch-npu 2.10.0.post7、
 vLLM 0.30.0+empty、pytest 8.3.2。这是本次单元测试环境，不能当作
@@ -350,6 +354,42 @@ Python 源码规则。actionlint 采用仓库固定的 1.7.7 版本单独执行�
 | 主模型 MSA 下沉 | 主模型自身 metadata 接口与稀疏计算闭环 | 本次范围之外 |
 
 ## 8. 性能收益与约束
+
+### 8.1 本次减少的开销
+
+builder 删除未使用的 `actual_seq_lengths_q` CPU 列表，并对 query 边界、
+KV 长度各创建一次设备视图，供兼容字段共用。原来的 CPU `.tolist()`
+本身不是 NPU 同步，但有重复切片和 Python 列表分配成本。
+本轮没有新增设备 `.item()`、`.cpu()`、`.tolist()` 或显式同步等待。
+
+新后端写好 output 后，公共 forward 原来仍执行
+`output[:num_tokens] = attn_output[:num_tokens]`。现在只在返回对象不同于
+原 output 时执行该复制。这是 Python 对象身份判断，不读取设备张量内容。
+测试覆盖原地写入、独立返回和 padding，`copy_` 调用从每层两次降为一次。
+算子公共接口尚不接受 output buffer，因此算子结果写回的那一次复制仍需保留。
+
+本地 Host 微基准以本轮修改前的 `e6d254867` 为基线，直接取其 builder
+方法，与当前方法交替计时；每种 batch 预热 100 次，每组运行 5000 次，
+重复 9 组并取中位数。环境为 aarch64、Python 3.11.10、Torch 2.10.0+cpu、
+单线程，输入为 CPU 张量，沿用仓库 NPU mock。结果只反映 builder 的主机开销：
+
+| 请求数 | 修改前 / μs | 修改后 / μs | 主机开销降低 |
+| --- | --- | --- | --- |
+| 1 | 9.538 | 5.918 | 37.9% |
+| 32 | 9.697 | 5.911 | 39.0% |
+| 256 | 13.118 | 5.879 | 55.2% |
+| 1024 | 23.982 | 5.924 | 75.3% |
+
+基准脚本和结果分别保存在本地 `dspark-fa3-mrv2-host-benchmark.py` 与
+`dspark-fa3-mrv2-host-benchmark.json`，未加入运行时依赖。
+另用 Torch dispatch 统计修改前后的公共 forward，确认 `copy_` 为 2 次 / 1 次。
+这些结果不代表 NPU kernel 时延、实际吞吐或 TPOT 的改善比例。
+
+仅调用一次的辅助特征判断已直接放回 M3 初始化；注释缩短为接口约束和
+实现原因。必要的版本、缓存布局和 mask 校验保留，它们用于阻止不支持的
+输入。metadata builder 的构造函数仍需实现，因为上游将该接口声明为抽象方法。
+
+### 8.2 端到端收益与验收
 
 预期收益来自减少草稿 GQA 的有效长度回传和 Host 动态 tiling 等待，
 以及多个相同参数草稿层复用设备 metadata。初始化缓存视图的改动不增加

@@ -97,8 +97,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         external_fa3 = (
             getattr(self.vllm_config.speculative_config, "attention_backend", None) == AttentionBackendEnum.FLASH_ATTN
         )
-        # The upstream selector cache key omits model_tag. A target GQA layer
-        # and a causal draft layer can otherwise reuse each other's backend.
+        # The upstream cache key omits model_tag; isolate draft backend selection.
         if external_fa3:
             _cached_get_attn_backend.cache_clear()
         try:

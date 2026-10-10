@@ -522,11 +522,6 @@ def _get_text_config(vllm_config: VllmConfig) -> PretrainedConfig:
     return vllm_config.model_config.hf_text_config
 
 
-def _uses_aux_hidden_states(vllm_config: VllmConfig) -> bool:
-    speculative_config = vllm_config.speculative_config
-    return speculative_config is not None and speculative_config.method in ("eagle3", "dspark")
-
-
 def _get_max_position_embeddings(config: PretrainedConfig) -> int:
     max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
     max_model_len = getattr(config, "max_model_len", None)
@@ -990,7 +985,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
-        self._enable_aux_hidden_states = _uses_aux_hidden_states(vllm_config)
+        speculative_config = vllm_config.speculative_config
+        self._enable_aux_hidden_states = speculative_config is not None and speculative_config.method in (
+            "eagle3",
+            "dspark",
+        )
 
         self.vocab_size = text_config.vocab_size
         self.num_hidden_layers = text_config.num_hidden_layers

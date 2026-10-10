@@ -76,8 +76,7 @@ class AscendDSparkFAMetadataBuilder(AttentionMetadataBuilder[AscendDSparkFAMetad
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec) -> AttentionCGSupport:
-        # AICPU metadata runs on a separate stream in 0.4.2.post1. Enable FULL
-        # only after device-length changes have been validated across replay.
+        # AICPU metadata graph replay is unverified in 0.4.2.post1.
         return AttentionCGSupport.NEVER
 
     def build(
@@ -88,15 +87,15 @@ class AscendDSparkFAMetadataBuilder(AttentionMetadataBuilder[AscendDSparkFAMetad
     ) -> AscendDSparkFAMetadata:
         common = common_attn_metadata
         num_reqs = common.num_reqs
-        # CPU query boundaries are already known to MRV2. Never read device KV
-        # lengths here: the CPU mirror may include rejected/lookahead tokens.
+        query_start_loc = common.query_start_loc[: num_reqs + 1]
+        # Host KV lengths may include rejected/lookahead tokens.
+        seq_lens = common.seq_lens[:num_reqs]
         return AscendDSparkFAMetadata(
             num_actual_tokens=common.num_actual_tokens,
-            query_start_loc=common.query_start_loc[: num_reqs + 1],
-            query_start_loc_gpu=common.query_start_loc[: num_reqs + 1],
-            actual_seq_lengths_q=common.query_start_loc_cpu[1 : num_reqs + 1].tolist(),
-            seq_lens=common.seq_lens[:num_reqs],
-            seq_lens_gpu=common.seq_lens[:num_reqs],
+            query_start_loc=query_start_loc,
+            query_start_loc_gpu=query_start_loc,
+            seq_lens=seq_lens,
+            seq_lens_gpu=seq_lens,
             block_tables=common.block_table_tensor[:num_reqs],
             slot_mapping=common.slot_mapping[: common.num_actual_tokens],
             max_query_len=common.max_query_len,
@@ -169,8 +168,7 @@ class AscendDSparkFAImpl(AscendAttentionBackendImpl):
         if self.sliding_window is None:
             window_size = (-1, -1)
         else:
-            # vLLM's window includes the query itself. Non-causal SWA uses
-            # the same symmetric window convention as its GPU FA backend.
+            # vLLM's window includes the query itself.
             window_size = (self.sliding_window - 1, 0 if causal else self.sliding_window - 1)
         params = dict(
             cache_seqlens=attn_metadata.seq_lens_gpu,
@@ -182,8 +180,7 @@ class AscendDSparkFAImpl(AscendAttentionBackendImpl):
             softcap=self.softcap,
             num_splits=1,
         )
-        # This is the paged capacity, not the maximum dynamic KV length. The
-        # 0.4.2.post1 metadata fingerprint requires it to match the forward.
+        # The 0.4.2.post1 fingerprint uses paged capacity for max_seqlen_k.
         max_seqlen_k = block_size * attn_metadata.block_tables.shape[1]
         schedule_key = (
             num_reqs,
@@ -212,8 +209,7 @@ class AscendDSparkFAImpl(AscendAttentionBackendImpl):
                 **params,
             )
             attn_metadata.scheduler_metadata[schedule_key] = scheduler_metadata
-        # Ascend's existing cache-update hook writes K/V before attention.
-        # Do not pass append-KV arguments: that would write the query twice.
+        # The inherited cache-update hook has already written K/V.
         attn_output = self._fa3_fn(
             query,
             self.key_cache,

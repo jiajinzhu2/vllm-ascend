@@ -48,8 +48,7 @@ class HardwareCapability(Enum):
     as broad claims about the underlying silicon.
     """
 
-    # Opt-in external flash-attn-npu paged GQA with device-side AICPU metadata.
-    # Package availability is checked separately; this does not promise graph replay.
+    # External paged GQA with AICPU metadata; package availability is checked separately.
     FLASH_ATTN_NPU_AICPU_METADATA = auto()
     # Legacy default: replace vLLM's custom-op list with ``["all"]`` during
     # platform configuration. Runtime extension loading is a separate contract.

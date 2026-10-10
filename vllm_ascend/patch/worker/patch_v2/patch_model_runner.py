@@ -95,8 +95,7 @@ def initialize_kv_cache(
         and speculative_config.attention_backend == AttentionBackendEnum.FLASH_ATTN
         and speculative_config.enforce_eager
     ):
-        # The external AICPU draft is eager-only; its NEVER support must not
-        # disable graph execution for target MSA layers running separately.
+        # The eager draft must not disable target model graphs.
         attn_cg_support = get_attn_cg_support(self.attn_groups, self.vllm_config, target_attn_layer_names)
     additional_attn_cg_support = self.model_state.get_additional_cg_support()
     attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)

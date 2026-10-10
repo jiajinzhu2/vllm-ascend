@@ -1640,8 +1640,7 @@ def _reshape_kv_cache_v2(
             elif isinstance(raw_cache, tuple):
                 raw_k_tensor, raw_v_tensor = raw_cache
                 if getattr(group.backend, "requires_contiguous_kv_cache", False):
-                    # Packed K/V kernels do not accept a padded block stride.
-                    # Keep any page padding at the end of each allocation.
+                    # Packed K/V kernels require padding outside the logical cache.
                     raw_k_tensor = raw_k_tensor[: math.prod(k_shape) * get_dtype_size(k_dtype)]
                     raw_v_tensor = raw_v_tensor[: math.prod(v_shape) * get_dtype_size(v_dtype)]
                 k_cache = raw_k_tensor.view(k_dtype).view(k_shape)
@@ -1653,9 +1652,7 @@ def _reshape_kv_cache_v2(
                 if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)) or getattr(
                     group.backend, "requires_contiguous_kv_cache", False
                 ):
-                    # MLA backends return a 4D latent cache shape. Keep its K
-                    # and V components in contiguous regions, as in MRv1.
-                    # External packed GQA kernels require the same storage.
+                    # MLA and packed GQA kernels require contiguous K and V regions.
                     typed_cache = raw_cache.view(k_dtype)
                     k_elements = math.prod(k_shape)
                     v_elements = math.prod(v_shape)

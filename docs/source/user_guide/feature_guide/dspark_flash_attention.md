@@ -93,6 +93,8 @@ must supply their own layer window and `get_draft_attn_causal()` declarations.
   for the next step.
 - MRV2 creates contiguous K/V views over the existing allocation. It does not
   copy or transpose the whole KV cache each step.
+- The builder reuses device views without making a CPU query-length list.
+  Forward skips the redundant self-copy when the backend has written output.
 
 For the public checkpoint, Model Optimizer's generation mask keeps context
 positions `k > absolute_q - 1024` and makes the current eight-token anchor

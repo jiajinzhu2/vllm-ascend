@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.compilation.backends import set_model_tag
 from vllm.model_executor.models.qwen3_dflash import _resolve_layer_attention
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -52,7 +53,7 @@ def _metadata(*, causal=False):
         max_query_len=3,
         max_seq_len=3072,
         query_start_loc=torch.tensor([0, 3, 4], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 3, 4], dtype=torch.int32),
+        query_start_loc_cpu=None,
         seq_lens=valid_lengths,
         seq_lens_cpu=torch.tensor([1034, 2057], dtype=torch.int32),
         seq_lens_cpu_upper_bound=torch.tensor([1034, 2057], dtype=torch.int32),
@@ -91,9 +92,38 @@ def test_builder_uses_valid_device_lengths_and_query_maximum():
     assert metadata.seq_lens_cpu is None
     assert metadata.seq_lens_list is None
     assert metadata.max_query_len == 3
-    assert metadata.actual_seq_lengths_q == [3, 4]
+    assert metadata.actual_seq_lengths_q is None
+    assert metadata.seq_lens is metadata.seq_lens_gpu
+    assert metadata.query_start_loc is metadata.query_start_loc_gpu
     assert metadata.attn_mask is None
     assert metadata.causal is False
+
+
+@pytest.mark.parametrize("writes_output", [False, True])
+def test_forward_copies_output_once_and_preserves_padding(writes_output):
+    class CountCopies(TorchDispatchMode):
+        copies = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.copy_.default:
+                self.copies += 1
+            return func(*args, **(kwargs or {}))
+
+    metadata, _ = _metadata()
+    impl = _impl(sliding_window=1024)
+    layer = SimpleNamespace(layer_name="draft.attn", _k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros(7, 4, 128, dtype=torch.bfloat16)
+    output = torch.full_like(query, -9)
+    if not writes_output:
+        # Backends returning a separate result still need the parent's copy.
+        result = torch.full_like(query, -9)
+        result[:4] = 1
+        impl.forward_impl = Mock(return_value=result)
+    with CountCopies() as counter:
+        assert impl.forward(layer, query, None, None, None, metadata, output=output) is output
+    assert counter.copies == 1
+    torch.testing.assert_close(output[:4], torch.ones_like(output[:4]))
+    torch.testing.assert_close(output[4:], torch.full_like(output[4:], -9))
 
 
 @pytest.mark.parametrize("context_length", [0, 1, 1015, 2045])
