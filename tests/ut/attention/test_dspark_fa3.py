@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from vllm.compilation.backends import set_model_tag
+from vllm.model_executor.models.qwen3_dflash import _resolve_layer_attention
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig, _cached_get_attn_backend
@@ -93,6 +94,45 @@ def test_builder_uses_valid_device_lengths_and_query_maximum():
     assert metadata.actual_seq_lengths_q == [3, 4]
     assert metadata.attn_mask is None
     assert metadata.causal is False
+
+
+@pytest.mark.parametrize("context_length", [0, 1, 1015, 2045])
+def test_public_m3_dspark_window_matches_single_anchor_mask(context_length):
+    # nvidia/MiniMax-M3-DSpark config at e82db0e1895bc4e0c339ce670b2b553899a57f59.
+    # Model Optimizer's generation mask windows context per query, while keeping
+    # the current 8-token anchor block bidirectional. Multiple training anchors
+    # are deliberately outside this single-block inference contract.
+    config = SimpleNamespace(
+        layer_types=["sliding_attention"] * 6,
+        sliding_window=1024,
+        dflash_config={"use_swa": True, "swa_window_size": 1024, "causal": False},
+    )
+    assert [_resolve_layer_attention(config, idx) for idx in range(6)] == [(1024, False)] * 6
+    sliding_window, causal = _resolve_layer_attention(config, 0)
+    block_length = 8
+    page_size = 128
+    kv_length = context_length + block_length
+    metadata = AscendDSparkFAMetadata(
+        num_actual_tokens=block_length,
+        max_query_len=block_length,
+        query_start_loc_gpu=torch.tensor([0, block_length], dtype=torch.int32),
+        seq_lens_gpu=torch.tensor([kv_length], dtype=torch.int32),
+        block_tables=torch.zeros(1, (kv_length + page_size - 1) // page_size, dtype=torch.int32),
+        causal=causal,
+    )
+    impl = _impl(sliding_window=sliding_window)
+    query = torch.zeros(block_length, impl.num_heads, impl.head_size, dtype=torch.bfloat16)
+    impl.forward_impl(query, None, None, None, metadata, torch.empty_like(query))
+    params = impl._fa3_fn.call_args.kwargs
+    assert params["causal"] is False
+    left, right = params["window_size"]
+    q_positions = context_length + torch.arange(block_length)[:, None]
+    kv_positions = torch.arange(kv_length)[None, :]
+    operator_mask = (kv_positions >= q_positions - left) & (kv_positions <= q_positions + right)
+    context_mask = (kv_positions < context_length) & (kv_positions > q_positions - sliding_window)
+    anchor_mask = kv_positions >= context_length
+    torch.testing.assert_close(operator_mask, context_mask | anchor_mask)
+    assert operator_mask[:, context_length:].all()
 
 
 @pytest.mark.parametrize("causal", [False, True])

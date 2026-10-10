@@ -27,23 +27,37 @@ It must provide both `flash_attn_with_kvcache` and `get_scheduler_metadata`.
 
 ## Enabling the draft backend
 
+The public checkpoint pair is
+[MiniMaxAI/MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3)
+and [nvidia/MiniMax-M3-DSpark](https://huggingface.co/nvidia/MiniMax-M3-DSpark).
+The draft revision `e82db0e1895bc4e0c339ce670b2b553899a57f59` has six GQA
+layers, 32 query heads, eight KV heads, head size 128, and an eight-token block.
+All six layers declare non-causal SWA 1024. Both models use hidden size 6144
+and vocabulary size 200064.
+
 Keep the target model's existing MSA startup options. Add the following draft
 options to its speculative configuration:
 
 ```json
 {
   "method": "dspark",
-  "model": "/path/to/minimax-m3-dspark-draft",
-  "num_speculative_tokens": 7,
+  "model": "nvidia/MiniMax-M3-DSpark",
+  "revision": "e82db0e1895bc4e0c339ce670b2b553899a57f59",
+  "num_speculative_tokens": 8,
   "attention_backend": "FLASH_ATTN",
   "kv_cache_dtype": "auto",
   "enforce_eager": true
 }
 ```
 
-Use the checkpoint's actual speculative block width rather than assuming seven
-tokens. Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_KV_CACHE_LAYOUT=NHD`.
+This checkpoint uses the anchor as its first prediction: eight query positions
+produce eight draft tokens. It does not use DFlash's extra bonus-token slot.
+For a different checkpoint, verify `sample_from_anchor` and the trained block
+width. Set `VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_KV_CACHE_LAYOUT=NHD`.
 The draft KV cache must be FP16/BF16 even if the target uses a quantized cache.
+Keep the target's MSA KV block size at 128. Use `--dtype bfloat16` for the target;
+vLLM uses the target dtype when constructing this draft, whose raw HF config
+declares float32. This backend does not accept FP32 Q/K/V.
 
 Attention visibility comes from the draft checkpoint. For the Qwen3-style
 DSpark model already registered by vLLM Ascend, the following draft HF config
@@ -80,9 +94,13 @@ must supply their own layer window and `get_draft_attn_causal()` declarations.
 - MRV2 creates contiguous K/V views over the existing allocation. It does not
   copy or transpose the whole KV cache each step.
 
-The public operator's standard sliding window is distinct from a specialized
-Anchor block mask. A checkpoint requiring different anchor visibility needs
-an explicit operator contract and additional integration work.
+For the public checkpoint, Model Optimizer's generation mask keeps context
+positions `k > absolute_q - 1024` and makes the current eight-token anchor
+block fully visible. With one block per request, `window_size=(1023, 1023)`
+expresses exactly this visibility: the whole anchor block fits within the
+window. A CPU regression checks this equivalence at short and long context
+boundaries. This does not provide the arbitrary multi-anchor mask used during
+training or support draft blocks wider than the window.
 
 ## Current validation boundary
 

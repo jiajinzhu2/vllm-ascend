@@ -18,8 +18,8 @@ def test_dspark_fa3_against_sdpa(dtype, causal, sliding_window):
         pytest.skip("Requires an Ascend A3 NPU")
     fa3 = pytest.importorskip("flash_attn_npu_3")
     torch.manual_seed(123)
-    query_lengths = [7, 3]
-    query_starts = torch.tensor([0, 7, 10], dtype=torch.int32, device="npu")
+    query_lengths = [8, 3]
+    query_starts = torch.tensor([0, 8, 11], dtype=torch.int32, device="npu")
     cache_lengths = torch.tensor([1025, 2053], dtype=torch.int32, device="npu")
     num_heads, num_kv_heads, head_size = 4, 2, 64
     block_size, blocks_per_request = 128, 24

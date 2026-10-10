@@ -33,6 +33,41 @@ ModelRunner V2 推理链路。增加可独立选择的草稿 attention backend�
 发布包、tag 和仓库 main 不能混用：后续 main 的参数签名可能变化，
 本次按照上述固定版本接入。
 
+### 2.1 已核实的公开主模型与草稿模型
+
+本次通过公开模型 API、固定 revision 的 `config.json` 和 NVIDIA
+Model Optimizer 源码核对了以下组合，不再使用未确认的草稿模型名称：
+
+| 项目 | 主模型 | 草稿模型 |
+| --- | --- | --- |
+| Hugging Face model ID | `MiniMaxAI/MiniMax-M3` | `nvidia/MiniMax-M3-DSpark` |
+| 查验 revision | `f0e1c1e04d40177e4673a22097036854f536e9c0` | `e82db0e1895bc4e0c339ce670b2b553899a57f59` |
+| 模型架构 | `MiniMaxM3SparseForConditionalGeneration` | `Qwen3DSparkModel` |
+| 文本 hidden size | 6144 | 6144 |
+| 词表大小 | 200064 | 200064 |
+| 文本层数 | 60 | 6 |
+| Query / KV heads | 64 / 4 | 32 / 8，即 GQA 比例 4 |
+| Head dimension | 128 | 128 |
+| Attention | 主模型配置中的 MSA | 六层均为 SWA 1024、`causal=false` |
+
+草稿的 `dflash_config.target_layer_ids` 是 `[1, 12, 23, 35, 46, 57]`，
+`mask_token_id=200063`，`shift_label=true`。草稿使用 Markov head，
+`markov_rank=256`，并携带 confidence head 配置。
+
+两个“block size”必须区分：草稿 `block_size=8` 表示一次预测的块宽，
+主模型 MSA 的 `sparse_block_size=128` 表示 KV 分页粒度。
+这个 DSpark 模型以 anchor 位置作为第一次预测，八个 query 产生八个
+草稿 token，示例使用 `num_speculative_tokens=8`，与官方模型卡一致。
+不能沿用普通 DFlash 的“一个 bonus anchor 加 N 个 mask”约定而减一。
+
+草稿原始配置的 `torch_dtype=float32` 不能直接作为外部算子的输入类型。
+当前 vLLM 创建草稿 `ModelConfig` 时沿用主模型 dtype；主模型应明确使用
+`--dtype bfloat16`，并保持草稿 `kv_cache_dtype=auto`。
+
+这里完成的是模型配置与接口语义核对。已检查的本地权重目录和启动配置
+尚未定位到这对 M3 / DSpark checkpoint；没有因此下载模型权重、启动服务
+或声称整模型验证通过。
+
 ## 3. 业务问题与改动目的
 
 ### 3.1 主模型和草稿模型使用不同的 attention
@@ -135,9 +170,28 @@ builder 使用每个 cache group 的 `causal`，实现使用每层的
 第 `i` 个 query 的逻辑位置为 `Lkv - Lq + i`。mask 在这个位置上施加窗口
 和因果限制，不能将每个请求的 query 都从 KV 第零个位置开始对齐。
 
-标准双向 SWA 不等价于任意 Anchor block mask。当前公开 v3 接口没有
-专门的 Anchor mask 参数，真实草稿 checkpoint 是否需要额外 anchor
-可见性规则仍需核对。本次不会通过无条件 `causal=False` 宣称完成特殊 mask。
+对已核实的 `nvidia/MiniMax-M3-DSpark`，NVIDIA Model Optimizer 的
+`_build_generate_swa_mask` 在推理时使用以下可见性：
+
+1. 历史 context 满足 `k < Lctx` 且 `k > absolute_q - 1024`；
+2. 当前八个位置的 anchor block 全部可见；
+3. 每个请求只有当前一个草稿块，其他请求通过分页表与 query 边界隔离。
+
+这里 `Lkv = Lctx + 8`，所以 `absolute_q = Lctx + i`。窗口左界
+`absolute_q - 1023` 与源码的严格不等式 `k > absolute_q - 1024`
+相同；块内最大距离只有 7，小于 1023，因此对称窗口完整保留整个块。
+所以 **对这个 checkpoint 的单 Anchor 块推理，标准非因果 SWA 可以
+准确表达 mask**，不需要额外的 dense mask 或每步构造 `[Q, K]` 张量。
+
+新增 CPU 回归在 context 长度 0、1、1015、2045 时，分别使用实际后端
+传出的窗口和训练代码的 context / block 定义构造布尔可见性并逐元素比较，
+覆盖短 context、1024 边界和长 context。它同时验证上游模型配置解析器
+对六层都解析为 `(1024, False)`。
+
+训练阶段多个 anchor 共用一段长 context 时，还需要同块可见性与不同
+anchor 间隔离，不能直接用一整个标准滑窗替代。当前公开 v3 接口没有
+通用 Anchor mask 参数；本次只接当前推理的单块路径，不扩展到多 Anchor
+训练、窗口小于块宽或其他特殊 mask。
 
 ### 5.3 metadata 与算子参数保持一致
 
@@ -210,7 +264,9 @@ MRV2 原有初始化会统计全部 attention group 的图能力，新后端的 
 ```json
 {
   "method": "dspark",
-  "model": "/path/to/minimax-m3-dspark-draft",
+  "model": "nvidia/MiniMax-M3-DSpark",
+  "revision": "e82db0e1895bc4e0c339ce670b2b553899a57f59",
+  "num_speculative_tokens": 8,
   "attention_backend": "FLASH_ATTN",
   "kv_cache_dtype": "auto",
   "enforce_eager": true
@@ -218,8 +274,10 @@ MRV2 原有初始化会统计全部 attention group 的图能力，新后端的 
 ```
 
 草稿的窗口、因果属性和辅助层编号应以训练 checkpoint 为准，
-不能仅根据这份示例覆盖现有模型配置。主模型路径与草稿模型路径还未提供，
-因此没有在本环境中启动服务或进行模型推理。
+不能仅根据这份示例覆盖其他模型配置。主模型使用上述公开 model ID
+或其本地权重目录，保留原有 A3 MSA 部署参数、`--block-size 128`，
+并明确设置 `--dtype bfloat16`。model ID 和配置已查明，实机环境与整模型
+数值和性能验证仍未完成。
 
 ## 7. 验证证据与验收范围
 
@@ -234,6 +292,7 @@ MRV2 原有初始化会统计全部 attention group 的图能力，新后端的 
 - 主模型 / 草稿 attention selector 缓存隔离及主模型图能力保留；
 - A3 / MRV2 要求与不支持功能的失败提示；
 - 全量 / SWA 1024 与因果 / 非因果参数组合；
+- 公开 M3 DSpark 六层配置解析及单 Anchor 块 mask 等价性；
 - CPU 上界含有拒绝 token 时仍使用设备有效长度；
 - 自定义 scale 与 metadata 指纹一致；
 - 只处理真实 query token，保留输出 padding；
@@ -242,7 +301,7 @@ MRV2 原有初始化会统计全部 attention group 的图能力，新后端的 
 - M3 采集带 residual 的辅助特征，后续 residual 修改不影响采集结果。
 - M3 fallback 提供 DSpark 公共模块需要的导入符号。
 
-实际运行结果为 **270 passed，14 个现有 TorchScript 弃用提示**。
+实际运行结果为 **274 passed，14 个现有 TorchScript 弃用提示**。
 运行范围包括新后端与 M3 辅助特征用例，以及现有 M3、硬件能力、MRV2
 attention / cache、DSpark speculator 和 graph contract 回归，共 8 个文件。
 
@@ -316,7 +375,7 @@ metadata 时间和 D2H 事件。不能将“删除了一段 CPU 长度读取”�
 ## 9. Draft PR 的定位与下一步
 
 本次 PR 用于审阅接口接入、长度与 mask 语义、MRV2 缓存布局和验证方案。
-在确认真实草稿 checkpoint 的 mask 定义后，优先补齐 A3 算子数值与
+已核实公开草稿 checkpoint 的单 Anchor 块 mask 定义，下一步优先补齐 A3 算子数值与
 MiniMax M3 + DSpark 的整模型验证，再评估 FULL graph 和性能。
 
 fork 的 main 与本次上游基线存在历史分歧，因此准备从上述最新 main
@@ -324,6 +383,11 @@ fork 的 main 与本次上游基线存在历史分歧，因此准备从上述最
 
 ## 10. 一手依据
 
+- [主模型固定配置](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json)：MSA、KV block size 128、主模型文本维度。
+- [草稿固定配置](https://huggingface.co/nvidia/MiniMax-M3-DSpark/blob/e82db0e1895bc4e0c339ce670b2b553899a57f59/config.json)：GQA、六层 SWA 1024、非因果、辅助层和 block size 8。
+- [草稿固定模型卡](https://huggingface.co/nvidia/MiniMax-M3-DSpark/blob/e82db0e1895bc4e0c339ce670b2b553899a57f59/README.md)：主模型配对与 `num_speculative_tokens=8` 示例。
+- [NVIDIA Model Optimizer 单块生成 mask](https://github.com/NVIDIA/Model-Optimizer/blob/54d44161e50e2253b241f2130ba856a3bac881c4/modelopt/torch/speculative/plugins/hf_dflash.py#L664)：逐 query 的 context 滑窗与块内可见性。
+- [NVIDIA M3 DSpark 训练配置](https://github.com/NVIDIA/Model-Optimizer/blob/54d44161e50e2253b241f2130ba856a3bac881c4/tools/launcher/examples/MiniMaxAI/MiniMax-M3/hf_streaming_dspark_multi_node.yaml)：草稿维度、block 8、MSA page 128 和辅助特征编号。
 - [固定版本的 Python 接口](https://github.com/MinghuasLab/flash-attention-npu/blob/e813f5f162260498241e4b24bfb7d1c4e8ffaf8a/flash_attn_npu_3/flash_attn_npu_interface.py)：窗口、分页参数与 metadata 指纹。
 - [固定版本的 Host / metadata 分支](https://github.com/MinghuasLab/flash-attention-npu/blob/e813f5f162260498241e4b24bfb7d1c4e8ffaf8a/csrc/ascend910/flash_attn_npu_3/flash_api.cpp)：Host 长度回传、AICPU launch 与静态容量。
 - [固定版本的 AICPU metadata](https://github.com/MinghuasLab/flash-attention-npu/blob/e813f5f162260498241e4b24bfb7d1c4e8ffaf8a/csrc/ascend910/flash_attn_npu_3/fa_metadata.aicpu)：动态有效长度、任务拆分和窗口处理。
