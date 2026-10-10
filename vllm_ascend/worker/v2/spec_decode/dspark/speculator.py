@@ -25,6 +25,8 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import _cached_get_attn_backend
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
@@ -92,8 +94,19 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
-        with disable_profiling_chunk_for_draft(self.vllm_config):
-            model = super().load_draft_model(target_model, target_attn_layer_names)
+        external_fa3 = (
+            getattr(self.vllm_config.speculative_config, "attention_backend", None) == AttentionBackendEnum.FLASH_ATTN
+        )
+        # The upstream selector cache key omits model_tag. A target GQA layer
+        # and a causal draft layer can otherwise reuse each other's backend.
+        if external_fa3:
+            _cached_get_attn_backend.cache_clear()
+        try:
+            with disable_profiling_chunk_for_draft(self.vllm_config):
+                model = super().load_draft_model(target_model, target_attn_layer_names)
+        finally:
+            if external_fa3:
+                _cached_get_attn_backend.cache_clear()
         if hasattr(model, "post_process"):
             model.post_process(self.vllm_config)
         if hasattr(model, "configure_target_aux_hidden_capture"):

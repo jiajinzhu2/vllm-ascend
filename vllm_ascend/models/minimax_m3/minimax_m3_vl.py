@@ -108,6 +108,12 @@ def _install_fused_allreduce_norm_fallback() -> None:
         return norm(hidden_states, residual)
 
     cast(Any, fallback_module).fused_allreduce_gemma_rms_norm = fused_allreduce_gemma_rms_norm
+    # DSpark's shared proposer imports Kimi's common RMSNorm helper, which
+    # also imports the CUDA fusion availability symbols from this module.
+    # Keep it on its ordinary all-reduce + norm path on Ascend.
+    cast(Any, fallback_module).flashinfer_trtllm_fused_allreduce_norm = None
+    cast(Any, fallback_module)._AR_RESIDUAL_RMS_NORM = None
+    cast(Any, fallback_module)._can_use_flashinfer = lambda *_args: (False, 0)
     sys.modules[module_name] = fallback_module
 
 

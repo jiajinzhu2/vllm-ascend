@@ -3,8 +3,10 @@
 
 from contextlib import AbstractContextManager
 
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as upstream
+from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
@@ -85,6 +87,17 @@ def initialize_kv_cache(
             self.device,
             draft_layer_names=draft_attn_layer_names,
         )
+    speculative_config = self.vllm_config.speculative_config
+    if (
+        target_attn_layer_names is not None
+        and speculative_config is not None
+        and speculative_config.method == "dspark"
+        and speculative_config.attention_backend == AttentionBackendEnum.FLASH_ATTN
+        and speculative_config.enforce_eager
+    ):
+        # The external AICPU draft is eager-only; its NEVER support must not
+        # disable graph execution for target MSA layers running separately.
+        attn_cg_support = get_attn_cg_support(self.attn_groups, self.vllm_config, target_attn_layer_names)
     additional_attn_cg_support = self.model_state.get_additional_cg_support()
     attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
     # The speculator clears the flag at load time when the checkpoint has

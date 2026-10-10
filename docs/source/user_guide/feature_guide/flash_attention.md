@@ -1,5 +1,9 @@
 # Flash Attention 3
 
+This page describes the training-consistency backend. For the separate A3
+DSpark draft backend with standard SWA and device metadata, see
+[A3 DSpark FlashAttention](dspark_flash_attention.md).
+
 !!! note
 
     Flash Attention 3 on Ascend is currently in beta. The `flash_attn_npu` package required for FA3 has been open-sourced on GitHub.
