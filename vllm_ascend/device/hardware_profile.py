@@ -48,6 +48,8 @@ class HardwareCapability(Enum):
     as broad claims about the underlying silicon.
     """
 
+    # External paged GQA with AICPU metadata; package availability is checked separately.
+    FLASH_ATTN_NPU_AICPU_METADATA = auto()
     # Legacy default: replace vLLM's custom-op list with ``["all"]`` during
     # platform configuration. Runtime extension loading is a separate contract.
     AUTO_ENABLE_CUSTOM_OPS = auto()
@@ -307,6 +309,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
             capabilities=_A3_CAPABILITIES
             | {
+                HardwareCapability.FLASH_ATTN_NPU_AICPU_METADATA,
                 HardwareCapability.CANN_MEGAMOE,
                 HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                 HardwareCapability.NPU_TOP_K_TOP_P,

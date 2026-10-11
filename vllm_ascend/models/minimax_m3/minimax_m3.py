@@ -985,8 +985,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
-        self._enable_eagle3_aux_hidden_states = (
-            vllm_config.speculative_config is not None and vllm_config.speculative_config.method == "eagle3"
+        speculative_config = vllm_config.speculative_config
+        self._enable_aux_hidden_states = speculative_config is not None and speculative_config.method in (
+            "eagle3",
+            "dspark",
         )
 
         self.vocab_size = text_config.vocab_size
@@ -1073,7 +1075,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return hidden_states
 
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        if self._enable_eagle3_aux_hidden_states:
+        if self._enable_aux_hidden_states:
             EagleModelMixin._set_aux_hidden_state_layers(self, layers)
         else:
             EagleModelMixin._set_aux_hidden_state_layers(self, ())

@@ -251,6 +251,9 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        if _validate_dspark_fa3_backend(selected_backend, attn_selector_config):
+            return "vllm_ascend.attention.dspark_fa3.AscendDSparkFABackend"
+
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
@@ -1470,6 +1473,47 @@ def _disable_expandable_segments() -> None:
     if updated_configs != npu_alloc_configs:
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = updated_configs
         logger.info("Removed expandable_segments from PYTORCH_NPU_ALLOC_CONF: %s", updated_configs)
+
+
+def _validate_dspark_fa3_backend(selected_backend, attn_selector_config):
+    from vllm.compilation import backends
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    # A draft-only opt-in. M3's MSA and the existing RL FA3 path keep their
+    # own selectors, even when the target also has ordinary GQA layers.
+    if selected_backend != AttentionBackendEnum.FLASH_ATTN or backends.model_tag != "dspark_head":
+        return False
+    config = get_current_vllm_config()
+    if (
+        config.speculative_config is None
+        or config.speculative_config.method != "dspark"
+        or config.speculative_config.attention_backend != AttentionBackendEnum.FLASH_ATTN
+    ):
+        return False
+    if not config.use_v2_model_runner:
+        raise ValueError("DSpark FA3 requires ModelRunner V2 (VLLM_USE_V2_MODEL_RUNNER=1).")
+    if not config.speculative_config.enforce_eager:
+        raise ValueError("DSpark FA3 currently requires speculative_config.enforce_eager=true for AICPU metadata.")
+    if not get_current_hardware_profile().supports(HardwareCapability.FLASH_ATTN_NPU_AICPU_METADATA):
+        raise ValueError("The DSpark FA3 metadata backend is currently enabled for Ascend A3 only.")
+    if attn_selector_config.use_mla or attn_selector_config.use_sparse:
+        raise ValueError("DSpark FA3 only supports draft GQA; target MSA must use its existing backend.")
+    if attn_selector_config.use_pcp or attn_selector_config.use_dcp:
+        raise ValueError("DSpark FA3 does not support context-parallel draft KV caches.")
+    if attn_selector_config.has_sink or attn_selector_config.use_per_head_quant_scales:
+        raise ValueError("DSpark FA3 does not support sinks or quantized KV caches.")
+    if attn_selector_config.use_mm_prefix or attn_selector_config.use_rswa:
+        raise ValueError("DSpark FA3 only supports causal/non-causal attention with an optional sliding window.")
+    if attn_selector_config.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("DSpark FA3 requires FP16/BF16 queries.")
+    if attn_selector_config.kv_cache_dtype not in (None, "auto", "float16", "bfloat16"):
+        raise ValueError("DSpark FA3 requires an FP16/BF16 draft KV cache.")
+    if not 0 < attn_selector_config.head_size <= 256:
+        raise ValueError("DSpark FA3 supports head dimensions in [1, 256].")
+    if util.find_spec("flash_attn_npu_3") is None:
+        raise ValueError("DSpark FA3 requires flash-attn-npu==0.4.2.post1; install its Ascend 910 backend.")
+    return True
 
 
 def _validate_fa3_backend(key, _attn_selector_config):
