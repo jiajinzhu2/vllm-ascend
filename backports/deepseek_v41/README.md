@@ -25,6 +25,22 @@ vision, Engram, context-parallel implementation, compressor/indexer, general
 KV-cache extensions, four complete native operator directories, their
 standalone extensions, examples and unrelated reference tests.
 
+## Reuse boundary for another target model
+
+These files are a DSpark reference for a later model-specific port. They do
+not establish compatibility with another model or checkpoint.
+
+- Head computations can be reused only when the new draft has the same trained
+  Markov/confidence architecture and corresponding checkpoint parameters.
+- `dspark_weights.py` is **DeepSeek-specific**. A different checkpoint needs
+  its own namespace conversion and loading checks.
+- The draft network, auxiliary-hidden-state selection/projection, attention
+  and cache layout must follow the actual draft implementation.
+- The proposer provides a reference for block preparation and cache-group
+  bookkeeping. Its newer runner/kernel dependencies still require a 0.20 port.
+- Native MTP support alone does not establish DSpark compatibility. The
+  draft forward path and trained parameters are needed to determine that.
+
 ## Sources
 
 - Base: `jiajinzhu2/vllm-ascend:releases/v0.20.2rc`,
