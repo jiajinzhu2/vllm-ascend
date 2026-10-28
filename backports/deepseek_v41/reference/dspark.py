@@ -26,8 +26,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsEagle3
-from .dspark_heads import DSparkConfidenceHead, DSparkMarkovHead
-from .dspark_weights import remap_dspark_weight
+from vllm_ascend.models.deepseek_v41.dspark_heads import DSparkConfidenceHead, DSparkMarkovHead
+from vllm_ascend.models.deepseek_v41.dspark_weights import remap_dspark_weight
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix, process_eagle_weight
 
 from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
@@ -48,7 +48,7 @@ from vllm_ascend.models.deepseek_v41.model import (
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.utils import enable_dsa_cp, normalize_deepseek_v41_config
 
-from .model import DeepseekV41MixtureOfExperts, DeepseekV41MoE
+from vllm_ascend.models.deepseek_v41.model import DeepseekV41MixtureOfExperts, DeepseekV41MoE
 
 
 def _apply_dsv4_rope(
