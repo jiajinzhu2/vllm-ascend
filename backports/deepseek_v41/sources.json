@@ -1,0 +1,907 @@
+[
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/docs/aclnnQuantLightningIndexerV2.md",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/docs/aclnnQuantLightningIndexerV2.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/docs/qli_v2_two_level_topk_design.md",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/docs/qli_v2_two_level_topk_design.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/examples/test_aclnn_quant_lightning_indexer_v2.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/examples/test_aclnn_quant_lightning_indexer_v2.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_host/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_host/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_def.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_def.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_infershape.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_infershape.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_common_arch22.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_common_arch22.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_kernel_arch22.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_kernel_arch22.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_cube_arch22.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_cube_arch22.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_vector_arch22.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_vector_arch22.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_vector.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_vector.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_service_cube_arch35.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_service_cube_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_service_vector_arch35.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_service_vector_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/quant_lightning_indexer_v2_topk.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/quant_lightning_indexer_v2_topk.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/quant_lightning_indexer_v2_vector1.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/quant_lightning_indexer_v2_vector1.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/vf_topk.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/vf_topk.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/vf_topk_16_gather_quant_v2.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/arch35/vf/vf_topk_16_gather_quant_v2.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_metadata.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_template_tiling_key.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/op_kernel/quant_lightning_indexer_v2_template_tiling_key.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/compare_batch_outputs.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/compare_batch_outputs.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/batch_consistency.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/batch_consistency.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/compare.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/compare.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/golden.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/golden.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/inputs.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/inputs.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/metadata_inputs.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/metadata_inputs.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/metadata_protocol.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/metadata_protocol.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/npu_preprocess.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/impl/npu_preprocess.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/spec.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/assets/spec.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/README.md",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/README.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/list_pt_from_excel.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/list_pt_from_excel.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_loadprocess.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_loadprocess.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_save.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/quant_lightning_indexer_v2_pt_save.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/replace_path.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch/replace_path.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch_isolated_run.sh",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/batch_isolated_run.sh",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/collect_perf_data.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/collect_perf_data.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/pytest.ini",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/pytest.ini",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/qliv2_parameter_normalization.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/qliv2_parameter_normalization.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/qliv2_test_utils.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/qliv2_test_utils.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_acl_graph.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_acl_graph.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_golden.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/quant_lightning_indexer_v2_golden.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/result_compare_method.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/result_compare_method.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_qliv2_test_utils.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_qliv2_test_utils.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_batch.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_batch.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_paramset.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_paramset.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_single.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_quant_lightning_indexer_v2_single.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_run.sh",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/pytest/test_run.sh",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch22/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch22/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch22/test_quant_lightning_indexer_v2_tiling.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch22/test_quant_lightning_indexer_v2_tiling.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch35/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch35/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch35/test_quant_lightning_indexer_v2_tiling.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/arch35/test_quant_lightning_indexer_v2_tiling.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/test_quant_lightning_indexer_v2_infershape.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/test_quant_lightning_indexer_v2_infershape.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/test_quant_lightning_indexer_v2_utils.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/tests/ut/op_host/test_quant_lightning_indexer_v2_utils.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/__init__.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/__init__.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/csrc/quant_lightning_indexer.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/csrc/quant_lightning_indexer.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/graph_convert_quant_lightning_indexer.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/graph_convert_quant_lightning_indexer.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/quant_lightning_indexer.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2/torch_extension/quant_lightning_indexer.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/docs/aclnnQuantLightningIndexerV2Metadata.md",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/docs/aclnnQuantLightningIndexerV2Metadata.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/examples/test_aclnn_quant_lightning_indexer_v2_metadata.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/examples/test_aclnn_quant_lightning_indexer_v2_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/examples/test_torch_quant_lightning_indexer_v2_metadata.py",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/examples/test_torch_quant_lightning_indexer_v2_metadata.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/aclnn_quant_lightning_indexer_v2_metadata.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/aclnn_quant_lightning_indexer_v2_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/aclnn_quant_lightning_indexer_v2_metadata.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/aclnn_quant_lightning_indexer_v2_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/quant_lightning_indexer_v2_metadata.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/quant_lightning_indexer_v2_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/quant_lightning_indexer_v2_metadata.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/op_api/quant_lightning_indexer_v2_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/quant_lightning_indexer_v2_metadata_check.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_host/quant_lightning_indexer_v2_metadata_check.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/CMakeLists.txt",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.cpp",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.h",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.json",
+    "original_path": "csrc/attention/quant_lightning_indexer_v2_metadata/op_kernel_aicpu/quant_lightning_indexer_v2_metadata_aicpu.json",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/CMakeLists.txt",
+    "original_path": "csrc/attention/sparse_flash_mla/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/README.md",
+    "original_path": "csrc/attention/sparse_flash_mla/README.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/docs/aclnnSparseFlashMla.md",
+    "original_path": "csrc/attention/sparse_flash_mla/docs/aclnnSparseFlashMla.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/docs/design.md",
+    "original_path": "csrc/attention/sparse_flash_mla/docs/design.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/docs/ratio2_a2a3.md",
+    "original_path": "csrc/attention/sparse_flash_mla/docs/ratio2_a2a3.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/examples/test_aclnn_sparse_flash_mla.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/examples/test_aclnn_sparse_flash_mla.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/CMakeLists.txt",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/base_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/base_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/base_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/base_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_adapter.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_adapter.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_context.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_context.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_runner.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_runner.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_runner.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_runner.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_sources.cmake",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/checker_sources.cmake",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/common_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/common_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/common_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/common_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/mask_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/mask_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/mask_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/mask_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/metadata_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/metadata_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/metadata_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/metadata_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/paged_attention_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/paged_attention_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/paged_attention_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/paged_attention_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/seq_len_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/seq_len_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/seq_len_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/seq_len_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sinks_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sinks_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sinks_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sinks_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/softmax_lse_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/softmax_lse_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/softmax_lse_checker_sparse_flash_mla.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/softmax_lse_checker_sparse_flash_mla.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_compression_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_compression_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_compression_checker.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_compression_checker.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_flash_mla_checker.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_flash_mla_checker.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_flash_mla_checker.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/checkers/sparse_flash_mla_checker.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_def.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_def.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_infershape.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_infershape.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_arch22_metadata.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_arch22_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_common_arch22.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_common_arch22.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_block_cube.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_block_cube.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_block_vector.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_block_vector.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_cube.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_cube.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_kernel.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_kernel.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/buffers_policy_3buff_sfa.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/buffers_policy_3buff_sfa.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/flash_decode.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/flash_decode.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/static_buffer.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/static_buffer.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/static_matmul.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/common/static_matmul.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_common_arch35.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_common_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_block_cube_arch35.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_block_cube_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_block_vector_arch35.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_block_vector_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_kernel_arch35.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_csa_kernel_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/util_regbase.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/arch35/util_regbase.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_common.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_common.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_kernel_metadata.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_kernel_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_template_tiling_key.h",
+    "original_path": "csrc/attention/sparse_flash_mla/op_kernel/sparse_flash_mla_template_tiling_key.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h",
+    "original_path": "csrc/attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/CMakeLists.txt",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/README.md",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/README.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/docs/aclnnSparseFlashMlaMetadata.md",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/docs/aclnnSparseFlashMlaMetadata.md",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/examples/test_aclnn_sparse_flash_mla_metadata.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/examples/test_aclnn_sparse_flash_mla_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/examples/test_torch_sparse_flash_mla_metadata.py",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/examples/test_torch_sparse_flash_mla_metadata.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/CMakeLists.txt",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/aclnn_sparse_flash_mla_metadata.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/aclnn_sparse_flash_mla_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/aclnn_sparse_flash_mla_metadata.h",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/aclnn_sparse_flash_mla_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/sparse_flash_mla_metadata.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/sparse_flash_mla_metadata.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/sparse_flash_mla_metadata.h",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/op_api/sparse_flash_mla_metadata.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/CMakeLists.txt",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/CMakeLists.txt",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.cpp",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.cpp",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.h",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.h",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.json",
+    "original_path": "csrc/attention/sparse_flash_mla_metadata/op_kernel_aicpu/sparse_flash_mla_metadata_aicpu.json",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "tests/deepseek_v41_utils.py",
+    "original_path": "tests/deepseek_v41_utils.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_cache.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_cache.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_dspark.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_dspark.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_hyper_connection.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_hyper_connection.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_layer_plan.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_layer_plan.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_operator_contracts.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_operator_contracts.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_preprocess.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_preprocess.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_release_config.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_release_config.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "backports/deepseek_v41/reference_tests/test_deepseek_v41_vision.py",
+    "original_path": "tests/ut/models/test_deepseek_v41_vision.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
+    "original_path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/attention/dsa_v41.py",
+    "original_path": "vllm_ascend/attention/dsa_v41.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/core/kv_cache_interface.py",
+    "original_path": "vllm_ascend/core/kv_cache_interface.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/__init__.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/__init__.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/cache_config.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/cache_config.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/compressor.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/compressor.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/dspark.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/engram/__init__.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/engram/__init__.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/engram/common.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/engram/common.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/engram/npu.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/engram/npu.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/indexer.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/indexer.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/model.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/model.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/vision.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/vision.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/models/deepseek_v41/vl_model.py",
+    "original_path": "vllm_ascend/models/deepseek_v41/vl_model.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  },
+  {
+    "path": "vllm_ascend/ops/triton/compressor/__init__.py",
+    "original_path": "vllm_ascend/ops/triton/compressor/__init__.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "vllm_ascend/ops/triton/compressor/compressor_triton.py",
+    "original_path": "vllm_ascend/ops/triton/compressor/compressor_triton.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "vllm_ascend/ops/triton/prepare_indexer_indices.py",
+    "original_path": "vllm_ascend/ops/triton/prepare_indexer_indices.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "vllm_ascend/ops/triton/quantize_indexer_query.py",
+    "original_path": "vllm_ascend/ops/triton/quantize_indexer_query.py",
+    "revision": "bd69bad88fc19e1aeeea585416d408df8bda8fef"
+  },
+  {
+    "path": "vllm_ascend/spec_decode/dspark_proposer.py",
+    "original_path": "vllm_ascend/spec_decode/dspark_proposer.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc"
+  }
+]

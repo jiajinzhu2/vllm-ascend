@@ -1,0 +1,236 @@
+{
+  "checked_files": 17,
+  "source_review_items": [
+    {
+      "path": "vllm_ascend/models/deepseek_v41/indexer.py",
+      "line": 18,
+      "module": "vllm_ascend.worker.device_metadata",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 21,
+      "module": "vllm.distributed",
+      "symbol": "get_ep_group",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 21,
+      "module": "vllm.distributed",
+      "symbol": "get_pp_group",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 21,
+      "module": "vllm.distributed",
+      "symbol": "get_tensor_model_parallel_rank",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 21,
+      "module": "vllm.distributed",
+      "symbol": "get_tensor_model_parallel_world_size",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 29,
+      "module": "vllm.model_executor.layers.fused_moe",
+      "symbol": "FusedMoEFactory",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 58,
+      "module": "vllm_ascend.models.common.ops.sequence_parallel",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 67,
+      "module": "vllm_ascend.utils",
+      "symbol": "normalize_deepseek_v41_config",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/model.py",
+      "line": 547,
+      "module": "vllm_ascend.models.layer.attention.layer",
+      "symbol": "DSV4_BLOCK_SIZES",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/vl_model.py",
+      "line": 12,
+      "module": "vllm.models.deepseek_v4_1.common.mm_preprocess",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/compressor.py",
+      "line": 8,
+      "module": "vllm.v1.kv_cache_interface",
+      "symbol": "CircularBufferSpec",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+      "line": 13,
+      "module": "vllm.distributed",
+      "symbol": "get_tensor_model_parallel_rank",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+      "line": 13,
+      "module": "vllm.distributed",
+      "symbol": "get_tensor_model_parallel_world_size",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+      "line": 36,
+      "module": "vllm_ascend.models.common.ops.sequence_parallel",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+      "line": 49,
+      "module": "vllm_ascend.utils",
+      "symbol": "normalize_deepseek_v41_config",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/dspark.py",
+      "line": 333,
+      "module": "vllm_ascend.utils",
+      "symbol": "get_rotation_path",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/cache_config.py",
+      "line": 9,
+      "module": "vllm.v1.kv_cache_interface",
+      "symbol": "CircularBufferSpec",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/engram/common.py",
+      "line": 14,
+      "module": "vllm.models.deepseek_v4_1.common.engram",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/engram/npu.py",
+      "line": 232,
+      "module": "vllm.distributed",
+      "symbol": "get_ep_group",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/models/deepseek_v41/engram/npu.py",
+      "line": 232,
+      "module": "vllm.distributed",
+      "symbol": "get_tp_group",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v41.py",
+      "line": 17,
+      "module": "vllm.compilation.breakable_cudagraph",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v41.py",
+      "line": 28,
+      "module": "vllm.v1.kv_cache_interface",
+      "symbol": "CircularBufferSpec",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v41.py",
+      "line": 30,
+      "module": "vllm_ascend.attention.dsa_v1",
+      "symbol": "build_dspark_swa_indices",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v41.py",
+      "line": 37,
+      "module": "vllm_ascend.ops.rope_dsv4",
+      "symbol": "get_full_cos_and_sin_dsa_for_layer",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/attention/dsa_v41.py",
+      "line": 42,
+      "module": "vllm_ascend.worker.device_metadata",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
+      "line": 8,
+      "module": "vllm.distributed",
+      "symbol": "get_tp_group",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
+      "line": 11,
+      "module": "vllm_ascend.attention.context_parallel.dsa_cp",
+      "symbol": "restore_tp_heads",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "line": 13,
+      "module": "vllm.v1.kv_cache_interface",
+      "symbol": "CircularBufferSpec",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "line": 23,
+      "module": "vllm.v1.kv_cache_spec_registry",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/core/kv_cache_interface.py",
+      "line": 364,
+      "module": "vllm_ascend.models.glm5next.kv_cache",
+      "reason": "missing source module"
+    },
+    {
+      "path": "vllm_ascend/spec_decode/dspark_proposer.py",
+      "line": 17,
+      "module": "vllm_ascend.attention.utils",
+      "symbol": "enable_pcp",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/spec_decode/dspark_proposer.py",
+      "line": 18,
+      "module": "vllm_ascend.ops.triton.spec_decode.utils",
+      "symbol": "copy_and_expand_dflash_and_dspark_inputs_kernel",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/spec_decode/dspark_proposer.py",
+      "line": 19,
+      "module": "vllm_ascend.spec_decode.dflash_proposer",
+      "symbol": "_compute_num_programs",
+      "reason": "export requires compatibility review"
+    },
+    {
+      "path": "vllm_ascend/spec_decode/dspark_proposer.py",
+      "line": 20,
+      "module": "vllm_ascend.spec_decode.utils",
+      "symbol": "DynamicSpecScheduler",
+      "reason": "export requires compatibility review"
+    }
+  ],
+  "integration_ready": false,
+  "note": "Source inspection only; runner/cache/native/inference gates remain separate."
+}
