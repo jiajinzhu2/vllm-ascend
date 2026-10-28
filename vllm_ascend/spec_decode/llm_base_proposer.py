@@ -50,6 +50,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.dspark_utils import sample_dspark_greedy
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -108,6 +109,8 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+    _dspark_seed_token_ids: torch.Tensor | None
+    _dspark_context_hidden_states: torch.Tensor | None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
@@ -291,6 +294,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         we share the target model's embedding layers with the draft model to save
         memory.
         """
+        if self.method == "dspark" and getattr(self.model, "has_own_embed_tokens", True) is not False:
+            # DSpark embeddings may be trained separately from the target.
+            # Missing flags must preserve checkpoint-owned weights.
+            return
         if get_pp_group().world_size == 1:
             if hasattr(target_language_model.model, "embed_tokens"):
                 target_embed_tokens = target_language_model.model.embed_tokens
@@ -349,15 +356,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     # share lm_head with the target model if needed
     def _maybe_share_lm_head(self, model: nn.Module) -> None:
+        if self.method == "dspark" and getattr(self.model, "has_own_lm_head", True) is not False:
+            return
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
-        if self.method in ("eagle", "dflash"):
-            logger.info("Loading EAGLE or DFLASH LM head weights from the target model.")
+        if self.method in ("eagle", "dflash", "dspark"):
+            logger.info("Loading %s LM head weights from the target model.", self.method.upper())
             if hasattr(model, "lm_head"):
                 self.model.lm_head = model.lm_head
             elif hasattr(model, "get_language_model") and hasattr(model.get_language_model(), "lm_head"):
                 self.model.lm_head = model.get_language_model().lm_head
             else:
+                if self.method == "dspark":
+                    raise AttributeError("DSpark requested a shared LM head but the target has no accessible lm_head")
                 logger.warning("Target model has no accessible lm_head for sharing.")
 
         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
@@ -376,6 +387,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:
+        if self.method == "dspark":
+            # Sharing trained indexer state is part of the model adapter's contract.
+            return
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             if hasattr(self.model.model, "topk_indices_buffer"):
                 del self.model.model.topk_indices_buffer
@@ -568,8 +582,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         next_token_ids: torch.Tensor,
         token_indices_to_sample: torch.Tensor | None,
         common_attn_metadata: CommonAttentionMetadata,
-        target_model_batch_desc: BatchDescriptor,
-        sampling_metadata: SamplingMetadata,
+        target_model_batch_desc: BatchDescriptor | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         req_scheduled_tokens=None,
         long_seq_metadata=None,
@@ -579,6 +593,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.method == "dspark":
+            return self._propose_dspark(
+                target_token_ids,
+                target_positions,
+                target_hidden_states,
+                next_token_ids,
+                token_indices_to_sample,
+                common_attn_metadata,
+                num_rejected_tokens_gpu,
+            )
+        assert target_model_batch_desc is not None
         batch_size = common_attn_metadata.batch_size()
 
         if token_indices_to_sample is None:
@@ -893,6 +918,72 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 
+    def build_dspark_attn_metadata(self, cad: CommonAttentionMetadata, num_input_tokens: int) -> dict[str, Any]:
+        """Build DSpark metadata independently for every draft cache group."""
+        raise NotImplementedError("DSpark requires cache-group-aware metadata preparation")
+
+    def clear_dspark_step_metadata(self) -> None:
+        """Release per-step DSpark input references, including after a failed forward."""
+        raise NotImplementedError("DSpark requires per-step metadata cleanup")
+
+    @torch.inference_mode()
+    def _propose_dspark(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the eager block drafter through the shared merged-draft entry point.
+
+        DSpark's first-pass hooks own cache-group-specific input preparation;
+        this base owns the forward context, model execution and Markov sampling.
+        The release's MTP metadata path assumes one draft cache group and must
+        not overwrite the DSpark hook's rejection-corrected length mirrors.
+        """
+        try:
+            num_tokens, sample_indices, cad, _ = self.set_inputs_first_pass(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+            num_input_tokens, across_dp, _ = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+            per_layer = self.build_dspark_attn_metadata(cad, num_input_tokens)
+            with self.tp_group_context, set_ascend_forward_context(
+                per_layer,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=across_dp,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                is_draft_model=True,
+                draft_attn_metadatas=[per_layer],
+            ):
+                get_forward_context().moe_layer_index = 0
+                context_states = self.model.combine_hidden_states(target_hidden_states)
+                if context_states.shape != (target_positions.numel(), self.hidden_size):
+                    raise ValueError("DSpark target projection returned an incompatible hidden-state shape")
+                self._dspark_context_hidden_states = context_states
+                return self._runnable(
+                    num_input_tokens=num_input_tokens,
+                    batch_size=cad.num_reqs,
+                    token_indices_to_sample=sample_indices,
+                    target_positions=target_positions,
+                    inputs_embeds=None,
+                    multi_steps_attn_metadata=[per_layer],
+                    num_tokens=num_tokens,
+                )
+        finally:
+            # A failed forward must not leave stale block tables for the next step.
+            self.clear_dspark_step_metadata()
+
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         logits = self.model.logits_processor(self.model.lm_head, hidden_states)
         if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
@@ -921,7 +1012,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
-        if self.method == "dflash":
+        if self.method in ("dflash", "dspark"):
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
         else:
             model_kwargs = {
@@ -937,12 +1028,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+        if self.method == "dspark":
+            # Context-KV preparation can execute draft layers before this forward.
+            get_forward_context().moe_layer_index = 0
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
         else:
             last_hidden_states, hidden_states = ret_hidden_states
+
+        if self.method == "dspark":
+            # A block uses one backbone pass. Only the lightweight Markov head
+            # runs sequentially; every step conditions on the previous target id.
+            if self._dspark_seed_token_ids is None:
+                raise RuntimeError("DSpark seed tokens have not been prepared")
+            return sample_dspark_greedy(
+                self.model,
+                last_hidden_states[token_indices_to_sample.long()],
+                self._dspark_seed_token_ids,
+                self.num_speculative_tokens,
+            )
 
         if self.method != "dflash":
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
@@ -1381,7 +1487,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return total_num_output_tokens, token_indices_to_sample, new_cad, None
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in ("mtp", "draft_model", "dflash", "dspark")
 
     def attn_update_stack_num_spec_norm(
         self,

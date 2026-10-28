@@ -128,6 +128,8 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layers
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
@@ -549,7 +551,9 @@ class NPUModelRunner(GPUModelRunner):
             self.decode_token_per_req = 1 + spec_token_num
             if get_pp_group().is_last_rank:
                 self.drafter = self._get_drafter()
-                if self.speculative_config.method == "eagle3":
+                if isinstance(self.drafter, AscendDSparkProposer):
+                    self.use_aux_hidden_state_outputs = True
+                elif self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
                 elif self.speculative_config.method == "extract_hidden_states":
@@ -561,6 +565,11 @@ class NPUModelRunner(GPUModelRunner):
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        if isinstance(self.drafter, AscendDSparkProposer):
+            return get_dspark_aux_layers(self.vllm_config)
+        return super()._get_eagle3_aux_layers_from_config()
 
     def _use_aclgraph(self) -> bool:
         return (
@@ -2995,6 +3004,10 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+            if isinstance(self.drafter, AscendDSparkProposer):
+                self.drafter.set_per_group_attn_metadata(
+                    kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                )
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3481,7 +3494,10 @@ class NPUModelRunner(GPUModelRunner):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            if isinstance(self.drafter, AscendDSparkProposer):
+                self.drafter.initialize_attn_backend(kv_cache_config, self.kernel_block_sizes)
+            else:
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
