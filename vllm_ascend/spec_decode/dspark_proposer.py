@@ -22,7 +22,6 @@ from vllm_ascend.spec_decode.dspark_utils import (
     get_dspark_aux_layers,
     get_dspark_config,
     prepare_dspark_inputs,
-    sample_dspark_greedy,
 )
 
 
@@ -86,20 +85,6 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
         self._per_group_kernel_block_sizes: dict[int, int] = {}
         self._query_slots: dict[int, torch.Tensor] = {}
-
-    def _maybe_share_embeddings(self, target_language_model):
-        # Missing flags must not overwrite checkpoint-trained draft embeddings.
-        if getattr(self.model, "has_own_embed_tokens", True) is False:
-            super()._maybe_share_embeddings(target_language_model)
-
-    def _maybe_share_lm_head(self, target_model):
-        if getattr(self.model, "has_own_lm_head", True) is False:
-            target = target_model.get_language_model() if hasattr(target_model, "get_language_model") else target_model
-            self.model.lm_head = target.lm_head
-
-    def _maybe_share_topk_indices(self, target_language_model):
-        # A model adapter owns any trained target/draft index-sharing contract.
-        pass
 
     def load_model(self, model):
         super().load_model(model)
@@ -170,25 +155,19 @@ class AscendDSparkProposer(AscendDflashProposer):
             self._per_group_block_tables[gid] = block_table
             self._per_group_slot_mappings[gid] = slot_mapping
 
-    def model_returns_tuple(self):
-        return False
-
-    @torch.inference_mode()
-    def _propose(
+    def set_inputs_first_pass(
         self,
         target_token_ids,
+        next_token_ids,
         target_positions,
         target_hidden_states,
-        next_token_ids,
         token_indices_to_sample,
-        common_attn_metadata,
-        target_model_batch_desc=None,
-        sampling_metadata=None,
-        num_rejected_tokens_gpu=None,
+        cad,
+        num_rejected_tokens_gpu,
         **kwargs,
     ):
-        del target_token_ids, token_indices_to_sample, target_model_batch_desc, sampling_metadata, kwargs
-        cad = copy(common_attn_metadata)
+        del target_token_ids, target_hidden_states, token_indices_to_sample, kwargs
+        cad = copy(cad)
         if next_token_ids.ndim != 1 or next_token_ids.numel() > cad.num_reqs:
             raise ValueError("DSpark needs one seed token per actual request")
         # Target graph metadata can contain extra padded request rows.
@@ -229,7 +208,16 @@ class AscendDSparkProposer(AscendDflashProposer):
         self.positions.zero_()
         self.input_ids[:num_queries].copy_(prepared.input_ids)
         self.positions[:num_queries].copy_(prepared.positions)
-        num_input_tokens, across_dp, _ = self.runner._sync_metadata_across_dp(num_queries, is_draft_model=True)
+        self._dspark_prepared = prepared
+        self._dspark_context_positions = target_positions
+        self._dspark_context_slots = context_slots
+        self._dspark_seed_token_ids = torch.where(next_token_ids >= 0, next_token_ids, self.parallel_drafting_token_id)
+        return num_queries, prepared.sample_indices, cad, None
+
+    def build_dspark_attn_metadata(self, cad, num_input_tokens):
+        prepared = self._dspark_prepared
+        batch_size = cad.num_reqs
+        num_queries = batch_size * self.num_query_per_req
         if num_input_tokens > self.max_query_tokens:
             raise ValueError("DSpark DP padding exceeds the query buffer capacity")
 
@@ -278,38 +266,28 @@ class AscendDSparkProposer(AscendDflashProposer):
             metadata = group.get_metadata_builder().build(0, group_cad, self.runner.get_model())
             for name in group.layer_names:
                 per_layer[name] = metadata
-        with self.tp_group_context, set_ascend_forward_context(
-            per_layer,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=across_dp,
-            num_actual_tokens=num_queries,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE,
-            is_draft_model=True,
-            draft_attn_metadatas=[per_layer],
-        ):
-            get_forward_context().moe_layer_index = 0
-            context_states = self.model.combine_hidden_states(target_hidden_states)
-            if context_states.shape != (num_context, self.hidden_size):
-                raise ValueError("DSpark target projection returned an incompatible hidden-state shape")
-            self.model.precompute_and_store_context_kv(
-                context_states,
-                target_positions,
-                [context_slots[self._layer_group_idx[name]] for name in self.attn_layer_names],
-            )
-            get_forward_context().moe_layer_index = 0
-            hidden = self.model(
-                input_ids=self.input_ids[:num_input_tokens],
-                positions=self.positions[:num_input_tokens],
-                inputs_embeds=None,
-            )
-            seeds = torch.where(next_token_ids >= 0, next_token_ids, self.parallel_drafting_token_id)
-            tokens = sample_dspark_greedy(
-                self.model, hidden[prepared.sample_indices.long()], seeds, self.num_speculative_tokens
-            )
+        return per_layer
+
+    def build_model_inputs_first_pass(self, num_input_tokens):
+        self.model.precompute_and_store_context_kv(
+            self._dspark_context_hidden_states,
+            self._dspark_context_positions,
+            [self._dspark_context_slots[self._layer_group_idx[name]] for name in self.attn_layer_names],
+        )
+        return dict(
+            input_ids=self.input_ids[:num_input_tokens],
+            positions=self.positions[:num_input_tokens],
+            inputs_embeds=None,
+        )
+
+    def clear_dspark_step_metadata(self):
         self._per_group_block_tables.clear()
         self._per_group_slot_mappings.clear()
-        return tokens
+        self._dspark_prepared = None
+        self._dspark_seed_token_ids = None
+        self._dspark_context_hidden_states = None
+        self._dspark_context_positions = None
+        self._dspark_context_slots = {}
 
     @torch.inference_mode()
     def dummy_run(self, num_tokens, num_reqs=0, is_profile=False, **kwargs):

@@ -8,9 +8,13 @@ still needs a compatible target/draft model adapter and NPU validation.
 ## Implemented
 
 - `vllm_ascend/spec_decode/dspark_proposer.py`: active runtime implementation.
-  Project target auxiliary states, populate context KV, prepare an anchor/noise
-  query block, run the draft backbone once, then sample sequentially through
-  the lightweight Markov head.
+  Prepare an anchor/noise query block, populate context KV and build metadata
+  separately for each cache group through first-pass hooks.
+- `llm_base_proposer.py`: DSpark execution and weight-sharing branches.
+  Project target auxiliary states, run the draft backbone once through the
+  shared `_run_merged_draft`, then sample through the sequential Markov head.
+  Preserve draft-owned embedding/LM-head weights unless the adapter explicitly
+  requests sharing. Reject a missing target head when sharing is requested.
 - `dspark_utils.py`: device tensor input preparation, rejection rollback,
   cache-slot masking and greedy Markov sampling with draft-to-target id mapping.
 - Proposer dispatch and MRV1 hooks: select a resolved draft architecture whose
@@ -22,9 +26,13 @@ still needs a compatible target/draft model adapter and NPU validation.
 - Ascend-local Markov/confidence heads compatible with vLLM 0.20 linear layers,
   plus the DeepSeek checkpoint-name conversion helper.
 
-The proposer uses its own eager first-pass path rather than the release's
-autoregressive MTP loop. The target's graph/parallel configuration is not
-mutated. Ordinary MTP architectures retain their existing proposer dispatch.
+The runner now calls the inherited base `_propose`, which dispatches to
+`_propose_dspark` and then `_runnable` / `_run_merged_draft`. The DSpark subclass
+does not override `_propose` or the model-execution method. Its hooks preserve
+the rejection-corrected lengths and separate cache-group metadata instead of
+entering the release's single-group MTP preparation loop. Per-step references
+are cleared on success and failure. The target's graph/parallel configuration
+is not mutated. Ordinary MTP architectures retain their existing dispatch.
 
 ## Integration contract
 
@@ -87,6 +95,8 @@ operator source imports are excluded from this PR.
 - DSpark reference and proposer: upstream
   [#16925](https://github.com/vllm-project/vllm-ascend/pull/16925),
   `0deca318102a07f9d8e027047652a2a0baab4fbc`.
+  The DSpark branches in `llm_base_proposer.py` are adapted from the same
+  revision to the release's eager/greedy interface.
 - Head mathematics: upstream vLLM
   `84030bbe3d74d99bad477a3d2e37a973ccd8865c`,
   `vllm/model_executor/models/qwen3_dspark.py`.
@@ -107,18 +117,24 @@ GLOO_SOCKET_IFNAME=lo python3 -m pytest --noconftest -q -o addopts='' \
   tests/ut/models/test_deepseek_v41_backport_runtime.py
 ```
 
-The CPU suite contains 61 cases: 25 algorithm/proposer/dispatch checks, 30
+The CPU suite contains 74 cases: 38 algorithm/proposer/dispatch checks, 30
 head/checkpoint primitives and six real vLLM linear-layer/Gloo checks.
 The proposer tests use real vLLM 0.20 metadata and AttentionGroup classes;
-NPU context and base initialization are substituted and the draft is a toy
-adapter. They verify one backbone call, Markov conditioning, cache-group
-order, rejection, padded target rows and host length mirrors. This is not
-full model-runner or real-weight inference validation.
+NPU imports/context and base initialization are substituted and the draft is
+a toy adapter. They execute the real shared-base proposer methods and verify
+one backbone call, Markov conditioning, cache-group order, rejection, padded
+target rows and host length mirrors. Added regressions cover weight ownership,
+failure cleanup and existing MTP/DFlash/EAGLE sampling. This is not full
+model-runner or real-weight inference validation.
 
-The five tests in `test_dspark_backport_npu.py` also passed on an Ascend
+The six tests in `test_dspark_backport_npu.py` also passed on an Ascend
 950DT with PyTorch/torch_npu 2.10. They compare input preparation to CPU for
 both anchor layouts and rejection cases, and check a mapped Markov chain.
-These are small tensor tests, not native-attention/model inference tests.
+The additional test extracts the production `_run_merged_draft` and
+`model_returns_tuple` methods, runs their DSpark branch with NPU tensors and
+a toy adapter, and checks one forward plus mapped Markov sampling with padding.
+These are small source-isolated checks, not vLLM 0.20 NPU integration or
+native-attention/model inference tests.
 
 Python syntax and whitespace checks passed. The required
 `bash format.sh ci` cannot run because `pre-commit` is unavailable.

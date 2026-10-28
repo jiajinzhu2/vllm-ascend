@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of DSpark algorithms and the production eager proposer.
 
-Only NPU forward-context/base initialization boundaries are substituted.
-Metadata and AttentionGroup use the real vLLM 0.20 CPU runtime.
+NPU imports, forward contexts and base initialization are substituted.
+The shared proposer methods, metadata and AttentionGroup are real code.
 """
 
 import importlib.util
@@ -15,6 +15,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
@@ -50,7 +51,40 @@ def modules(monkeypatch):
         contexts.append((metadata, kwargs))
         yield
 
-    class Base:
+    install(
+        "vllm_ascend.ascend_forward_context",
+        set_ascend_forward_context=forward_context,
+        _EXTRA_CTX=SimpleNamespace(capturing=False),
+    )
+    install("vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(enable_reduce_sample=False))
+    install("vllm_ascend.attention.attention_mask", AttentionMaskBuilder=object)
+    install(
+        "vllm_ascend.attention.attention_v1",
+        AscendAttentionState=SimpleNamespace(ChunkedPrefill="chunked"),
+    )
+    install("vllm_ascend.attention.utils", AscendCommonAttentionMetadata=CommonAttentionMetadata)
+    install(
+        "vllm_ascend.compilation.acl_graph",
+        ACLGraphWrapper=type("ACLGraphWrapper", (), {}),
+        update_full_graph_params=None,
+    )
+    install("vllm_ascend.distributed.parallel_state", get_lmhead_tp_group=None)
+    install("vllm_ascend.ops.triton.spec_decode.utils", prepare_inputs_padded_kernel=None)
+    install("vllm_ascend.ops.triton.triton_utils", get_vectorcore_num=None)
+    install(
+        "vllm_ascend.utils",
+        enable_sp=lambda *args: False,
+        lmhead_tp_enable=lambda: False,
+        shared_expert_dp_enabled=lambda: False,
+    )
+    base = load(
+        "vllm_ascend.spec_decode.llm_base_proposer",
+        "vllm_ascend/spec_decode/llm_base_proposer.py",
+    )
+    monkeypatch.setattr(base, "get_forward_context", lambda: SimpleNamespace())
+    monkeypatch.setattr(base, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+
+    class Base(base.AscendSpecDecodeBaseProposer):
         def __init__(self, config, device, runner=None):
             self.vllm_config = config
             self.speculative_config = config.speculative_config
@@ -63,28 +97,22 @@ def modules(monkeypatch):
             self.max_num_tokens = config.scheduler_config.max_num_batched_tokens
             self.max_model_len = config.model_config.max_model_len
             self.uses_mrope = False
+            self.uses_xdrope_dim = 0
             self.draft_uses_xdrope_dim = 0
             self.tp_group_context = nullcontext()
-
-        def _maybe_share_embeddings(self, target):
-            self.model.model.embed_tokens = target.model.embed_tokens
+            self._runnable = self._run_merged_draft
 
         def load_model(self, target):
             self.model = target.draft
             self._draft_attn_layer_names = set(self.model.get_draft_kv_cache_layer_names())
 
     install("vllm_ascend.spec_decode.dflash_proposer", AscendDflashProposer=Base)
-    install("vllm_ascend.ascend_forward_context", set_ascend_forward_context=forward_context)
-    install(
-        "vllm_ascend.attention.attention_v1",
-        AscendAttentionState=SimpleNamespace(ChunkedPrefill="chunked"),
-    )
     proposer = load(
         "vllm_ascend.spec_decode.dspark_proposer",
         "vllm_ascend/spec_decode/dspark_proposer.py",
     )
     monkeypatch.setattr(proposer, "get_forward_context", lambda: SimpleNamespace())
-    return SimpleNamespace(utils=utils, proposer=proposer, contexts=contexts, install=install, load=load)
+    return SimpleNamespace(utils=utils, proposer=proposer, base=base, contexts=contexts, install=install, load=load)
 
 
 def config(sample_from_anchor=True):
@@ -310,6 +338,16 @@ def make_proposer(modules, monkeypatch, anchor=True, pad=0):
 @pytest.mark.parametrize("writable_mirrors", [False, True])
 def test_actual_proposer_one_backbone_pass_and_per_group_metadata(modules, monkeypatch, anchor, writable_mirrors):
     cfg, proposer, builders = make_proposer(modules, monkeypatch, anchor=anchor)
+    assert type(proposer)._propose is modules.base.AscendSpecDecodeBaseProposer._propose
+    assert type(proposer)._run_merged_draft is modules.base.AscendSpecDecodeBaseProposer._run_merged_draft
+    merged_calls = []
+    run_merged = proposer._runnable
+
+    def record_merged(**kwargs):
+        merged_calls.append(kwargs)
+        return run_merged(**kwargs)
+
+    proposer._runnable = record_merged
     # Constructor must not mutate the target's configuration.
     assert cfg.speculative_config.parallel_drafting
     assert not cfg.speculative_config.enforce_eager
@@ -352,6 +390,9 @@ def test_actual_proposer_one_backbone_pass_and_per_group_metadata(modules, monke
     assert result.tolist() == [[1, 2, 0], [2, 0, 1]]
     assert proposer.model.forward_calls == 1
     assert proposer.model.logit_calls == 1
+    assert len(merged_calls) == 1
+    assert merged_calls[0]["batch_size"] == 2
+    assert merged_calls[0]["num_tokens"] == 2 * proposer.num_query_per_req
     states, positions, slots = proposer.model.context
     assert torch.equal(states, torch.ones(5, 2))
     # Context slots follow model order, not sorted names or cache-group order.
@@ -471,9 +512,140 @@ def test_required_trained_draft_contract_is_not_guessed(modules, missing):
     with pytest.raises(ValueError):
         modules.proposer.AscendDSparkProposer(cfg, torch.device("cpu"))
 
+
 def test_int32_seed_ids_return_int64_target_ids(modules):
     result = modules.utils.sample_dspark_greedy(
         ToyDraft(), torch.zeros(3, 2), torch.tensor([0], dtype=torch.int32), 3
     )
     assert result.dtype == torch.int64
     assert result.tolist() == [[1, 2, 0]]
+
+
+@pytest.mark.parametrize("ownership", [None, True, False])
+@pytest.mark.parametrize("multimodal_target", [False, True])
+def test_base_dspark_weight_sharing_requires_explicit_opt_in(modules, ownership, multimodal_target):
+    base = modules.base.AscendSpecDecodeBaseProposer
+    proposer = base.__new__(base)
+    proposer.method = "dspark"
+    proposer.use_compress = False
+    proposer.use_cuda_graph = False
+    proposer.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE))
+    own_embed, own_head, own_indices = object(), object(), object()
+    proposer.model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=own_embed, topk_indices_buffer=own_indices),
+        lm_head=own_head,
+    )
+    if ownership is not None:
+        proposer.model.has_own_embed_tokens = ownership
+        proposer.model.has_own_lm_head = ownership
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=object(), topk_indices_buffer=object()),
+        lm_head=object(),
+    )
+    outer = SimpleNamespace(get_language_model=lambda: target) if multimodal_target else target
+    proposer._maybe_share_embeddings(target)
+    proposer._maybe_share_lm_head(outer)
+    proposer._maybe_share_topk_indices(target)
+    assert proposer.model.model.embed_tokens is (target.model.embed_tokens if ownership is False else own_embed)
+    assert proposer.model.lm_head is (target.lm_head if ownership is False else own_head)
+    assert proposer.model.model.topk_indices_buffer is own_indices
+
+
+def test_base_dspark_missing_shared_head_fails(modules):
+    base = modules.base.AscendSpecDecodeBaseProposer
+    proposer = base.__new__(base)
+    proposer.method = "dspark"
+    proposer.model = SimpleNamespace(has_own_lm_head=False)
+    with pytest.raises(AttributeError, match="shared LM head"):
+        proposer._maybe_share_lm_head(SimpleNamespace())
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash", "eagle3"])
+def test_shared_merged_draft_keeps_existing_sampling_paths(modules, method):
+    base = modules.base.AscendSpecDecodeBaseProposer
+    proposer = base.__new__(base)
+    proposer.method = method
+    proposer.num_speculative_tokens = 1
+    proposer.parallel_drafting = False
+    proposer.pass_hidden_states_to_model = False
+    proposer.uses_mrope = False
+    proposer.uses_xdrope_dim = 0
+    proposer.draft_uses_xdrope_dim = 0
+    proposer.pcp_size = 1
+    proposer.input_ids = torch.tensor([4, 5])
+    proposer.positions = torch.tensor([10, 11])
+    proposer.maybe_all_gather_and_unpad = lambda hidden, positions, last: (hidden, positions, last)
+    proposer.build_model_inputs_first_pass = lambda n: dict(
+        input_ids=proposer.input_ids[:n], positions=proposer.positions[:n], inputs_embeds=None
+    )
+
+    class OrdinaryDraft:
+        forward_calls = 0
+
+        def __call__(self, **kwargs):
+            self.forward_calls += 1
+            assert kwargs["input_ids"].tolist() == [4, 5]
+            hidden = torch.zeros(2, 2)
+            return (hidden, hidden) if method == "eagle3" else hidden
+
+        def compute_logits(self, hidden):
+            return torch.tensor([[0.0, 5.0, 0.0], [0.0, 0.0, 5.0]])
+
+        def compute_draft_logits(self, hidden):
+            raise AssertionError("ordinary drafts must not enter DSpark sampling")
+
+    proposer.model = OrdinaryDraft()
+    result = proposer._run_merged_draft(
+        num_input_tokens=2,
+        batch_size=2,
+        token_indices_to_sample=torch.tensor([0, 1]),
+        target_positions=proposer.positions,
+        inputs_embeds=None,
+        multi_steps_attn_metadata=[],
+        num_tokens=2,
+    )
+    assert result.tolist() == [[1], [2]]
+    assert proposer.model.forward_calls == 1
+
+
+@pytest.mark.parametrize("failure", ["projection", "sampling", "dp_capacity"])
+def test_base_dspark_clears_step_state_on_failure(modules, monkeypatch, failure):
+    _, proposer, _ = make_proposer(modules, monkeypatch, pad=8 if failure == "dp_capacity" else 0)
+    table = torch.tensor([[9, 2, 8, 6]])
+    for gid in (0, 1):
+        proposer.set_per_group_attn_metadata(gid, table, torch.tensor([100]))
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1]),
+        query_start_loc_cpu=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([8]),
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=8,
+        block_table_tensor=table,
+        slot_mapping=torch.tensor([100]),
+    )
+    if failure == "projection":
+        proposer.model.combine_hidden_states = lambda states: states
+        message = "projection"
+    elif failure == "sampling":
+        proposer.model.compute_draft_logits = lambda hidden: torch.zeros(hidden.shape[0], 4)
+        message = "same vocabulary"
+    else:
+        message = "capacity"
+    with pytest.raises(ValueError, match=message):
+        proposer._propose(
+            torch.tensor([0]), torch.tensor([7]), torch.zeros(1, 4),
+            torch.tensor([0]), None, common,
+        )
+    assert proposer._per_group_block_tables == {}
+    assert proposer._per_group_slot_mappings == {}
+    assert proposer._dspark_seed_token_ids is None
+    assert proposer._dspark_context_hidden_states is None
+    assert proposer._dspark_context_slots == {}
+    # Retrying requires fresh runner metadata, even after a partial forward.
+    with pytest.raises(RuntimeError, match="did not supply"):
+        proposer._propose(
+            torch.tensor([0]), torch.tensor([7]), torch.zeros(1, 4),
+            torch.tensor([0]), None, common,
+        )

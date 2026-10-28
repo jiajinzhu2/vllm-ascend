@@ -10,5 +10,11 @@
     "original_path": "vllm_ascend/spec_decode/dspark_proposer.py",
     "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc",
     "status": "adapted eager runtime proposer for the vLLM 0.20 MRV1 interface"
+  },
+  {
+    "path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+    "original_path": "vllm_ascend/spec_decode/llm_base_proposer.py",
+    "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc",
+    "status": "adapted DSpark shared-base execution and weight-sharing branches; eager/greedy only"
   }
 ]
