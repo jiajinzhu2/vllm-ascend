@@ -20,6 +20,8 @@
 
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.dspark_utils import is_dspark_draft
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
@@ -31,6 +33,8 @@ from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
+    if is_dspark_draft(vllm_config):
+        return AscendDSparkProposer(vllm_config, device, runner)
     if method == "ngram":
         return AscendNgramProposer(vllm_config, runner)
     elif method == "ngram_gpu":

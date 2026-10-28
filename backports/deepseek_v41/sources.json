@@ -6,9 +6,9 @@
     "status": "integration reference; requires V4.1 base and release runner port"
   },
   {
-    "path": "backports/deepseek_v41/reference/dspark_proposer.py",
+    "path": "vllm_ascend/spec_decode/dspark_proposer.py",
     "original_path": "vllm_ascend/spec_decode/dspark_proposer.py",
     "revision": "0deca318102a07f9d8e027047652a2a0baab4fbc",
-    "status": "integration reference; requires V4.1 base and release runner port"
+    "status": "adapted eager runtime proposer for the vLLM 0.20 MRV1 interface"
   }
 ]
