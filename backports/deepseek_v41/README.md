@@ -101,3 +101,22 @@ result is claimed. All 16 NPUs on the supplied host were occupied by existing
 VLLM workers during inspection, so no model was launched. Full format/lint
 checks have not run; Ruff is unavailable in the isolated container and the
 configured package mirrors timed out.
+
+## Additional real vLLM CPU head validation
+
+A second isolated container provides vLLM `0.20.2+cpu`, PyTorch
+`2.11.0+cpu` and Python 3.12. The following command passed **36 tests**:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_PLUGINS=__none__ \
+GLOO_SOCKET_IFNAME=lo python3 -m pytest --noconftest -q -o addopts='' \
+  tests/ut/models/test_deepseek_v41_backport_primitives.py \
+  tests/ut/models/test_deepseek_v41_backport_runtime.py
+```
+
+This includes six tests using the real vLLM `ReplicatedLinear`, its
+weight-loading postprocessing, and a single-rank CPU/Gloo process group.
+Markov projection covers FP32/BF16 and soft capping; confidence covers both
+with/without Markov features. The other 30 tests retain their source-isolated
+scope. This establishes head-level CPU API compatibility only. It does not
+resolve the outstanding full-model, cache, runner or native/NPU gates above.
