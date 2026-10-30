@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-"""CPU orchestration contracts, NOT HY checkpoint/NPU attention validation.
+"""Portable numerical/contract tests; NOT checkpoint or Ascend kernel validation.
 
-Run with pytest --noconftest on a machine without vLLM/torch_npu. The complete
-DFlash and HY proposer modules are loaded. The Triton packer is replaced with
-a CPU reference; infrastructure imports are isolated and restored per test.
-The shared _propose and runner _sample methods are compiled from their actual
-source AST, without importing the hardware-dependent runner module.
+Run pytest --noconftest on CPU without vLLM/torch_npu. Infrastructure is isolated
+and restored per test. Attention, adapter, DFlash parent and HY proposer modules
+are loaded from real source. Tiny projections/3-D rotary exercise composition;
+they do not assert that a vendor checkpoint uses these toy weight layouts.
 """
 
 import __future__
@@ -15,26 +14,16 @@ import __future__
 import ast
 import importlib.util
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from enum import Enum
-from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
-import numpy as np
 import pytest
 import torch
-
-
-def source_methods(path, class_name, names, namespace):
-    tree = ast.parse(path.read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
-    methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    assert {node.name for node in methods} == set(names)
-    module = ast.Module(body=methods, type_ignores=[])
-    exec(compile(module, str(path), "exec", flags=__future__.annotations.compiler_flag), namespace)
-    return {name: namespace[name] for name in names}
+from torch import nn
 
 
 class GraphMode(Enum):
@@ -42,58 +31,15 @@ class GraphMode(Enum):
     FULL = 1
 
 
-class CpuPacker:
-    """Reference layout only; this does not execute or test the Triton kernel."""
-
-    def __getitem__(self, grid):
-        return self.run
-
-    @staticmethod
-    def run(**args):
-        table = args["block_table_ptr"]
-        starts = args["query_start_loc_ptr"].tolist()
-        positions = args["target_positions_ptr"]
-        block_size = args["block_size"]
-        query_length = args["num_query_per_req"]
-        for req in range(args["batch_size"]):
-            start, end = starts[req : req + 2]
-            for token in range(start, end):
-                pos = int(positions[token])
-                args["out_context_positions_ptr"][token] = pos
-                args["out_context_slot_mapping_ptr"][token] = (
-                    table[req, pos // block_size] * block_size + pos % block_size
-                )
-            rejected = int(args["num_rejected_tokens_ptr"][req]) if args["HAS_NUM_REJECTED"] else 0
-            last_position = int(positions[end - rejected - 1])
-            for step in range(query_length):
-                token = req * query_length + step
-                pos = last_position + step + 1
-                args["out_query_positions_ptr"][token] = pos
-                args["out_query_slot_mapping_ptr"][token] = (
-                    table[req, pos // block_size] * block_size + pos % block_size
-                )
-                args["out_input_ids_ptr"][token] = (
-                    args["next_token_ids_ptr"][req] if step == 0 else args["parallel_drafting_token_id"]
-                )
-                if step:
-                    args["out_token_indices_ptr"][req * (query_length - 1) + step - 1] = token
-
-
 @pytest.fixture
 def harness(monkeypatch):
     root = Path(__file__).resolve().parents[3]
     events = []
-    current = SimpleNamespace(value=None)
 
     @contextmanager
     def forward_context(metadata, config, **kwargs):
-        previous = current.value
-        current.value = SimpleNamespace(attn_metadata=metadata, cudagraph_runtime_mode=kwargs["aclgraph_runtime_mode"])
-        events.append(("context", kwargs))
-        try:
-            yield
-        finally:
-            current.value = previous
+        events.append(kwargs)
+        yield
 
     def register(name, **attrs):
         module = ModuleType(name)
@@ -102,73 +48,44 @@ def harness(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
         return module
 
-    for name in ("vllm", "vllm_ascend", "vllm_ascend.spec_decode"):
+    for name in (
+        "vllm",
+        "vllm_ascend",
+        "vllm_ascend.spec_decode",
+        "vllm_ascend.attention",
+        "vllm_ascend.patch",
+        "vllm_ascend.patch.worker",
+    ):
         register(name)
     register("vllm.config", CUDAGraphMode=GraphMode, VllmConfig=SimpleNamespace)
-    register("vllm.forward_context", get_forward_context=lambda: current.value)
+    register("vllm.forward_context", get_forward_context=lambda: None)
     register("vllm.v1.attention.backends.utils", CommonAttentionMetadata=SimpleNamespace)
     register(
         "vllm_ascend.ascend_forward_context", set_ascend_forward_context=forward_context, _EXTRA_CTX=SimpleNamespace()
     )
-    register("vllm_ascend.attention.attention_v1", AscendAttentionState=SimpleNamespace(ChunkedPrefill="chunked"))
+    register("vllm_ascend.attention.attention_v1", AscendAttentionState=SimpleNamespace())
     register("vllm_ascend.attention.utils", AscendCommonAttentionMetadata=SimpleNamespace)
     register("vllm_ascend.utils", lmhead_tp_enable=lambda: False)
-    register(
-        "vllm_ascend.ops.triton.spec_decode.utils",
-        copy_and_expand_dflash_inputs_kernel_single_grid=CpuPacker(),
-    )
+    register("vllm_ascend.ops.triton.spec_decode.utils", copy_and_expand_dflash_inputs_kernel_single_grid=None)
 
     class EagleStub:
         def __init__(self, config, device, runner=None):
             self.vllm_config = config
             self.speculative_config = config.speculative_config
-            self.device = device
-            self.runner = runner
-            self.hidden_size = 4
-            self.max_num_tokens = 16
-            self.max_batch_size = 4
+            self.device, self.runner = device, runner
+            self.hidden_size, self.max_num_tokens, self.max_batch_size = 4, 16, 4
             self.num_speculative_tokens = config.speculative_config.num_speculative_tokens
             self.dtype = torch.float32
-            self.uses_mrope = self.uses_xdrope_dim = self.supports_mm_inputs = False
-            self.use_cuda_graph = self.use_compress = self.enable_enpu = False
-            self.pcp_size = self.dcp_size = 1
-            self.method = "dflash"
-            self.parallel_drafting = True
-            self.parallel_drafting_token_id = 7
-            self.kernel_block_size = 4
-            self.token_arange_np = np.arange(17, dtype=np.int32)
-            self.input_ids = torch.zeros(16, dtype=torch.int32)
-            self.slot_mapping_group = [torch.zeros(16, dtype=torch.int32)]
-            self.seq_lens_group = [torch.zeros(16, dtype=torch.int32)]
-            self.query_start_loc_group = [torch.zeros(16, dtype=torch.int32)]
-            self.token_indices_to_sample = torch.zeros(16, dtype=torch.int32)
-            self.attn_layer_names = ["draft.layer.0", "draft.layer.1", "draft.layer.2"]
+            self.parallel_drafting_token_id = config.speculative_config.draft_model_config.hf_config.dflash_config[
+                "mask_token_id"
+            ]
+            self.eagle3_use_aux_hidden_state = self._get_eagle3_use_aux_hidden_state_from_config()
+            self.maybe_eager_context = nullcontext()
             self._runnable = self._run_merged_draft
 
         def get_model(self):
             return self.model
 
-        def _update_full_graph_params_if_needed(self, *args):
-            pass
-
-    globals_ = dict(
-        torch=torch,
-        partial=partial,
-        CUDAGraphMode=GraphMode,
-        set_ascend_forward_context=forward_context,
-        get_forward_context=lambda: current.value,
-        enable_sp=lambda *args: False,
-        Eagle3LlamaForCausalLM=type("EagleModel", (), {}),
-        DFlashQwen3ForCausalLM=type("QwenModel", (), {}),
-    )
-    methods = source_methods(
-        root / "vllm_ascend/spec_decode/llm_base_proposer.py",
-        "AscendSpecDecodeBaseProposer",
-        ["_propose", "_combine_target_hidden_states"],
-        globals_,
-    )
-    for name, method in methods.items():
-        setattr(EagleStub, name, method)
     register("vllm_ascend.spec_decode.eagle_proposer", AscendEagleProposer=EagleStub)
 
     def load(name, path):
@@ -178,21 +95,23 @@ def harness(monkeypatch):
         spec.loader.exec_module(module)
         return module
 
+    attention = load("vllm_ascend.attention.hy_dflash", "vllm_ascend/attention/hy_dflash.py")
+    adapter = load("vllm_ascend.patch.worker.hy_dflash", "vllm_ascend/patch/worker/hy_dflash.py")
     parent = load("vllm_ascend.spec_decode.dflash_proposer", "vllm_ascend/spec_decode/dflash_proposer.py")
     hy = load("vllm_ascend.spec_decode.hy_dflash_proposer", "vllm_ascend/spec_decode/hy_dflash_proposer.py")
     return SimpleNamespace(
         cls=hy.AscendHYDflashProposer,
         parent=parent.AscendDflashProposer,
+        attention=attention,
+        adapter=adapter,
         events=events,
-        context=forward_context,
-        config_globals=globals_,
+        root=root,
         register=register,
         load=load,
-        root=root,
     )
 
 
-def config(k=2):
+def config(k=7):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
             method="dflash",
@@ -200,191 +119,444 @@ def config(k=2):
             enforce_eager=True,
             draft_tensor_parallel_size=1,
             num_speculative_tokens=k,
-            draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={})),
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(dflash_config={"ascend_proposer": "hy", "mask_token_id": 120009})
+            ),
         ),
         parallel_config=SimpleNamespace(),
         lora_config=None,
     )
 
 
-class ToyModel:
-    """Three cache writers and deterministic prefix hooks, not MLA/DSA math."""
+class TinyProject(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = nn.Linear(4, 16, bias=False)
+        self.kv_a = nn.Linear(4, 9, bias=False)
+        self.norm = nn.RMSNorm(3)
 
-    hy_dflash_contract_version = 1
-
-    def __init__(self, events):
-        self.events = events
-        self.caches = [torch.full((128, 4), -99.0) for _ in range(3)]
-        self.indexer_caches = [torch.full((128, 4), -99.0) for _ in range(3)]
-        self.prefixes = []
-        self.hidden_prefix_lengths = []
-
-    def combine_hidden_states(self, hidden):
-        return hidden
-
-    def precompute_and_store_context_kv(self, hidden, positions, slots):
-        self.events.append(("prefill", None if slots is None else slots.clone()))
-        if slots is not None:
-            valid = slots >= 0
-            for layer, (cache, indexer) in enumerate(zip(self.caches, self.indexer_caches)):
-                cache[slots[valid].long()] = hidden[valid] + layer
-                indexer[slots[valid].long()] = hidden[valid] + layer
-
-    def __call__(self, input_ids, positions, inputs_embeds):
-        self.events.append(("query", input_ids.clone()))
-        return input_ids.float()[:, None].expand(-1, 4).contiguous()
-
-    def correct_hidden_states(self, hidden, previous_ids, step):
-        self.events.append(("correct", step))
-        self.prefixes.append(previous_ids.clone())
-        self.hidden_prefix_lengths.append(hidden.shape[1])
-        return hidden[:, step + 1, :] + previous_ids.sum(dim=-1, keepdim=True)
-
-    def select_hidden_path(self, corrected, step):
-        self.events.append(("select", step))
-        return corrected
-
-    def compute_logits(self, hidden):
-        self.events.append(("logits", len(hidden)))
-        ids = hidden[:, 0].long() % 5
-        return torch.nn.functional.one_hot(ids, num_classes=5).float()
+    def forward(self, hidden):
+        query = self.q(hidden).view(*hidden.shape[:2], 2, 8)
+        kv = self.kv_a(hidden)
+        return query[..., :2], query[..., 2:], self.norm(kv[..., :3]), kv[..., 3:]
 
 
-def make_proposer(harness, k=2):
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(lora_id_to_lora_request={}),
-        _sync_metadata_across_dp=lambda tokens, **kwargs: (tokens, None, None),
-        get_model=lambda: None,
+class TinyRotary(nn.Module):
+    def forward(self, positions, query, key):
+        self.seen_positions = positions.clone()
+        angles = positions.permute(1, 2, 0).float() * 0.03
+
+        def rotate(value, angle):
+            pairs = value.reshape(*value.shape[:-1], 3, 2)
+            first = pairs[..., 0] * angle.cos() - pairs[..., 1] * angle.sin()
+            second = pairs[..., 0] * angle.sin() + pairs[..., 1] * angle.cos()
+            return torch.stack((first, second), dim=-1).flatten(-2)
+
+        return rotate(query, angles[:, :, None]), rotate(key, angles)
+
+
+class TinyFinish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(4, 2)
+        self.o_proj = nn.Linear(4, 4, bias=False)
+
+    def forward(self, hidden, output):
+        return self.o_proj((output * self.gate(hidden).sigmoid()[..., None]).flatten(-2))
+
+
+class TinyMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate, self.up, self.down = nn.Linear(4, 12), nn.Linear(4, 12), nn.Linear(12, 4)
+
+    def forward(self, hidden):
+        assert hidden.ndim == 2
+        return self.down(torch.nn.functional.silu(self.gate(hidden)) * self.up(hidden))
+
+
+def make_model(harness):
+    torch.manual_seed(34)
+    a, m = harness.attention, harness.adapter
+    layers = []
+    for _ in a.HY_TARGET_LAYERS:
+        attention = a.HYDflashAttention(
+            TinyProject(),
+            TinyRotary(),
+            TinyFinish(),
+            torch.randn(2, 2, 3) * 0.1,
+            torch.randn(2, 2, 3) * 0.1,
+            rope_dim=6,
+            scale=8**-0.5,
+        )
+        layers.append(m.HYDenseDraftLayer(nn.RMSNorm(4), attention, nn.RMSNorm(4), TinyMLP()))
+    fusion = m.HYMTPFusion(nn.RMSNorm(4), nn.RMSNorm(4), nn.Linear(8, 4), torch.randn(4))
+    correction = m.HYHiddenCorrection(nn.RMSNorm(4), nn.RMSNorm(4), nn.Linear(8, 4), nn.Linear(8, 4), nn.Linear(4, 4))
+    return m.HYDflashAdapter(
+        layers,
+        nn.Embedding(120010, 4),
+        nn.RMSNorm(4),
+        fusion,
+        correction,
+        nn.Linear(4, 1, bias=True),
+        nn.Linear(4, 9),
+        hidden_size=4,
     )
-    proposer = harness.cls(config(k), torch.device("cpu"), runner)
-    proposer.model = ToyModel(harness.events)
 
-    def build(_, metadata, target, **kwargs):
-        harness.events.append(("build_metadata", metadata))
-        return SimpleNamespace(causal=metadata.causal, num_prefills=1)
 
-    proposer.draft_attn_groups = [SimpleNamespace(get_metadata_builder=lambda: SimpleNamespace(build=build))]
+class TargetProvider:
+    def __init__(self, attention):
+        self.attention = attention
+        self.caches = [torch.randn(8, 4, 9) for _ in attention.HY_TARGET_LAYERS]
+        self.calls = []
+
+    def get_hy_dflash_layer_names(self, layer_ids):
+        return [f"target.layers.{layer_id}.attn" for layer_id in layer_ids]
+
+    def get_hy_dflash_context(self, *, request_ids, anchor_positions, layer_ids, block_size):
+        self.calls.append((request_ids, anchor_positions.clone()))
+        batch = len(request_ids)
+        assert block_size == 8
+        page_base = torch.tensor([0 if req == "a" else 4 for req in request_ids])
+        table = page_base[:, None] + torch.arange(4)[None]
+        layers = tuple(
+            self.attention.HYTargetLayerState(layer_id, cache, table, torch.zeros(batch, 0, dtype=torch.int64))
+            for layer_id, cache in zip(layer_ids, self.caches)
+        )
+        positions = anchor_positions[:, None] + torch.arange(8)[None]
+        positions = positions[None] + torch.tensor([10, 20, 30])[:, None, None]
+        final_hidden = (anchor_positions - 1)[:, None].float().expand(-1, 4)
+        final_hidden = torch.nn.functional.rms_norm(final_hidden, (4,))
+        return self.attention.HYTargetState(layers, torch.zeros(batch, dtype=torch.int64), final_hidden, positions)
+
+
+def make_proposer(harness):
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["a", "b"]))
+    proposer = harness.cls(config(), torch.device("cpu"), runner)
+    proposer.model = make_model(harness)
+    proposer._target_model = TargetProvider(harness.attention)
     return proposer
 
 
-def batch():
-    positions = torch.tensor([2, 3, 4, 5, 10, 11, 12], dtype=torch.int32)
-    seq_lens = torch.tensor([6, 13], dtype=torch.int32)
-    starts = torch.tensor([0, 4, 7], dtype=torch.int32)
-    metadata = SimpleNamespace(
-        num_reqs=2,
-        query_start_loc=starts,
-        query_start_loc_cpu=starts.clone(),
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens.clone(),
-        _seq_lens_cpu=seq_lens.clone(),
-        seq_lens_cpu_upper_bound=seq_lens.clone(),
-        num_computed_tokens_cpu=torch.tensor([2, 10]),
-        block_table_tensor=torch.tensor([[2, 8, 9, 10, 11], [20, 21, 22, 23, 24]], dtype=torch.int32),
-        max_seq_len=13,
-        slot_mapping=torch.zeros(7, dtype=torch.int32),
-        causal=True,
-        positions=positions,
-        positions_cpu=positions.clone(),
-        batch_size=lambda: 2,
-    )
-    return dict(
-        target_token_ids=torch.arange(7),
-        target_positions=positions,
-        target_hidden_states=torch.arange(28, dtype=torch.float32).view(7, 4),
-        next_token_ids=torch.tensor([1, 2]),
-        token_indices_to_sample=None,
-        cad=metadata,
-        num_rejected_tokens_gpu=torch.tensor([2, 1], dtype=torch.int32),
+def metadata(lengths=(5, 9)):
+    return SimpleNamespace(
+        num_reqs=len(lengths),
+        seq_lens=torch.tensor(lengths),
+        max_seq_len=max(lengths),
+        slot_mapping=torch.tensor([888]),
+        query_start_loc=torch.tensor([0, 1, 2]),
     )
 
 
-def test_rejected_context_query_positions_and_cache_writes(harness):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    count, indices, metadata, _ = proposer.set_inputs_first_pass(**inputs)
-    assert count == 6
-    assert indices.tolist() == [1, 2, 4, 5]
-    assert proposer.input_ids[:6].tolist() == [1, 7, 7, 2, 7, 7]
-    assert metadata.positions.tolist() == [4, 5, 6, 12, 13, 14]
-    assert metadata.seq_lens.tolist() == [7, 15]
-    assert metadata.slot_mapping.tolist() == [32, 33, 34, 92, 93, 94]
-    assert metadata.causal
-    assert metadata.seq_lens_cpu is None and metadata._seq_lens_cpu is None
-    assert metadata.positions_cpu is None
-    assert metadata.seq_lens_cpu_upper_bound.tolist() == [9, 16]
-    assert inputs["cad"].seq_lens.tolist() == [6, 13]
-    assert inputs["cad"].query_start_loc.tolist() == [0, 4, 7]
-    assert proposer._context_slot_mapping_buffer[:7].tolist() == [10, 11, -1, -1, 90, 91, -1]
-    for layer, cache in enumerate(proposer.model.caches):
-        torch.testing.assert_close(cache[10], inputs["target_hidden_states"][0] + layer)
-        assert (cache[32:35] == -99).all()
-        assert (proposer.model.indexer_caches[layer][92] == -99).all()
-    assert len([event for event in harness.events if event[0] == "prefill"]) == 1
+def propose(proposer, lengths=(5, 9), rejected=None):
+    return proposer._propose(
+        None,
+        torch.full((3, 2), 999),
+        None,
+        torch.tensor([3, 4]),
+        None,
+        metadata(lengths),
+        None,
+        None,
+        num_rejected_tokens_gpu=rejected,
+    )
 
 
-@pytest.mark.parametrize("rejected", [None, torch.zeros(2, dtype=torch.int32)])
-def test_unpadded_and_all_accepted_context(harness, rejected):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    inputs["num_rejected_tokens_gpu"] = rejected
-    _, _, metadata, _ = proposer.set_inputs_first_pass(**inputs)
-    assert (proposer._context_slot_mapping_buffer[:7] >= 0).all()
-    assert metadata.positions.tolist() == [6, 7, 8, 13, 14, 15]
+@pytest.mark.parametrize("anchor,doc", [(0, 0), (1, 0), (3, 0), (4, 0), (9, 6)])
+def test_short_context_dense(harness, anchor, doc):
+    actual = harness.attention.select_context_indices(
+        torch.tensor([[777, -1]]), torch.tensor([anchor]), torch.tensor([doc]), topk=4, local_window=2
+    )
+    assert actual[actual >= 0].tolist() == list(range(doc, anchor))
+    assert actual.shape == (1, 6)
 
 
-def test_real_base_propose_dispatches_hy_hooks_and_samples_in_order(harness):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    inputs["common_attn_metadata"] = inputs.pop("cad")
-    ids = proposer._propose(**inputs, target_model_batch_desc=SimpleNamespace(uniform=False), sampling_metadata=None)
-    assert ids.tolist() == [[2, 4], [2, 4]]
-    events = [event[0] for event in harness.events if event[0] != "context"]
-    assert events == [
-        "prefill",
-        "build_metadata",
-        "query",
-        "correct",
-        "select",
-        "logits",
-        "correct",
-        "select",
-        "logits",
-    ]
-    assert proposer.model.prefixes[0].shape == (2, 0)
-    assert proposer.model.prefixes[1].tolist() == [[2], [2]]
-    assert proposer.model.hidden_prefix_lengths == [2, 3]
-    assert proposer.verification_probs() is None
+def test_context_union_layer_specific_and_document_bounds(harness):
+    result = harness.attention.select_context_indices(
+        torch.tensor([[1, 3, 7, 9], [4, 4, 8, 12]]),
+        torch.tensor([10, 10]),
+        torch.tensor([2, 2]),
+        topk=4,
+        local_window=3,
+    )
+    assert result[0].tolist() == [3, 7, 8, 9, -1, -1, -1]
+    assert result[1].tolist() == [4, 7, 8, 9, -1, -1, -1]
 
 
-def test_query_inputs_do_not_repeat_context_prefill(harness):
-    proposer = make_proposer(harness)
-    proposer.set_inputs_first_pass(**batch())
-    harness.events.clear()
-    proposer.build_model_inputs_first_pass(6)
-    assert harness.events == []
+def test_real_context_capacity(harness):
+    result = harness.attention.select_context_indices(torch.arange(2048)[None], torch.tensor([3000]), torch.tensor([0]))
+    assert result.shape == (1, 2056)
+    assert result[0, -8:].tolist() == list(range(2992, 3000))
 
 
-@pytest.mark.parametrize("profile", [False, True])
-def test_dummy_runs_all_stages_without_writing_live_context(harness, profile):
-    proposer = make_proposer(harness, k=5)
-    proposer.dummy_run(num_tokens=7, num_reqs=4, is_profile=profile, aclgraph_runtime_mode=GraphMode.FULL)
-    events = [event for event in harness.events if event[0] != "context"]
-    assert events[0] == ("prefill", None)
-    assert events[1][0] == "query" and len(events[1][1]) == 24
-    assert [event[0] for event in events].count("logits") == 5
-    assert all((cache == -99).all() for cache in proposer.model.caches)
-    assert all(event[1]["aclgraph_runtime_mode"] == GraphMode.NONE for event in harness.events if event[0] == "context")
+@pytest.mark.parametrize("topk,window,selection", [(0, 8, [[0]]), (2, -1, [[0]]), (1, 0, [[0, 1]])])
+def test_bad_context_capacity(harness, topk, window, selection):
+    with pytest.raises(ValueError):
+        harness.attention.select_context_indices(
+            torch.tensor(selection), torch.tensor([9]), torch.tensor([0]), topk=topk, local_window=window
+        )
 
 
-def test_dummy_empty_batch_is_noop(harness):
-    proposer = make_proposer(harness)
-    proposer.dummy_run(0, num_reqs=0)
-    assert harness.events == []
+def test_gather_pages_read_only(harness):
+    a = harness.attention
+    cache = torch.arange(3 * 4 * 9).view(3, 4, 9).float()
+    original = cache.clone()
+    layer = a.HYTargetLayerState(61, cache, torch.tensor([[2, 0], [1, 2]]), torch.empty(2, 0))
+    context = a.gather_context(layer, torch.tensor([[0, 5, -1], [3, 4, -1]]))
+    torch.testing.assert_close(context.kv[0, :2], torch.stack([cache[2, 0], cache[0, 1]]))
+    torch.testing.assert_close(context.kv[1, :2], torch.stack([cache[1, 3], cache[2, 0]]))
+    assert torch.count_nonzero(context.kv[:, -1]) == 0
+    context.kv.zero_()
+    assert torch.equal(cache, original)
+
+
+@pytest.mark.parametrize("table,indices", [([[0]], [[4]]), ([[-1]], [[0]]), ([[2]], [[0]])])
+def test_gather_unallocated_fails(harness, table, indices):
+    a = harness.attention
+    layer = a.HYTargetLayerState(61, torch.zeros(2, 4, 9), torch.tensor(table), torch.empty(1, 0))
+    with pytest.raises(ValueError, match="unallocated"):
+        a.gather_context(layer, torch.tensor(indices))
+
+
+def test_quantized_cache_requires_explicit_bridge(harness):
+    a = harness.attention
+    layer = a.HYTargetLayerState(61, torch.zeros(1, 4, 9, dtype=torch.int8), torch.tensor([[0]]), torch.empty(1, 0))
+    with pytest.raises(ValueError, match="dequantized"):
+        a.gather_context(layer, torch.tensor([[0]]))
+
+
+def attention_inputs(harness, dtype=torch.float32):
+    torch.manual_seed(52)
+    a = harness.attention
+    qn, qr = torch.randn(2, 8, 2, 2).to(dtype), torch.randn(2, 8, 2, 6).to(dtype)
+    latent, rope = torch.randn(2, 8, 3).to(dtype), torch.randn(2, 8, 6).to(dtype)
+    indices = torch.tensor([[0, 1, -1], [2, -1, -1]])
+    context = a.HYContext(61, indices, torch.randn(2, 3, 9).to(dtype), indices >= 0)
+    return qn, qr, latent, rope, context, torch.randn(2, 2, 3).to(dtype), torch.randn(2, 2, 3).to(dtype), 0.3
+
+
+def expanded_attention(args):
+    qn, qr, latent, rope, context, key_up, value_up, scale = args
+    all_latent = torch.cat((context.kv[..., :3], latent), 1).float()
+    all_rope = torch.cat((context.kv[..., 3:], rope), 1).float()
+    keys = torch.einsum("bsr,hdr->bshd", all_latent, key_up.float())
+    values = torch.einsum("bsr,hvr->bshv", all_latent, value_up.float())
+    outputs = []
+    for request in range(2):
+        rows = []
+        for slot in range(8):
+            allowed = torch.cat((context.valid[request], torch.arange(8) <= slot))
+            score = (keys[request, allowed] * qn[request, slot].float()).sum(-1)
+            score += (all_rope[request, allowed, None] * qr[request, slot].float()).sum(-1)
+            probs = (score * scale).softmax(dim=0)
+            rows.append((values[request, allowed] * probs[..., None]).sum(dim=0))
+        outputs.append(torch.stack(rows))
+    return torch.stack(outputs).to(qn.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_absorbed_matches_explicit_joint_softmax(harness, dtype):
+    args = attention_inputs(harness, dtype)
+    actual = harness.attention.absorbed_mla(*args)
+    torch.testing.assert_close(
+        actual,
+        expanded_attention(args),
+        rtol=0.015 if dtype == torch.bfloat16 else 1e-5,
+        atol=0.015 if dtype == torch.bfloat16 else 2e-6,
+    )
+
+
+def test_block_causal_and_request_isolation(harness):
+    args = list(attention_inputs(harness))
+    before = harness.attention.absorbed_mla(*args)
+    args[2] = args[2].clone()
+    args[3] = args[3].clone()
+    args[2][0, 4:] += 100
+    args[3][0, 4:] += 100
+    after = harness.attention.absorbed_mla(*args)
+    torch.testing.assert_close(after[0, :4], before[0, :4])
+    torch.testing.assert_close(after[1], before[1])
+    assert not torch.allclose(after[0, 4:], before[0, 4:])
+
+
+def test_masked_context_has_no_effect(harness):
+    args = list(attention_inputs(harness))
+    before = harness.attention.absorbed_mla(*args)
+    context = args[4]
+    kv = context.kv.clone()
+    kv[~context.valid] = 100
+    args[4] = replace(context, kv=kv)
+    torch.testing.assert_close(harness.attention.absorbed_mla(*args), before)
+
+
+@pytest.mark.parametrize("component", ["layout", "key_up", "query_rope", "block"])
+def test_attention_shape_guards(harness, component):
+    args = list(attention_inputs(harness))
+    if component == "layout":
+        args[4] = replace(args[4], kv=args[4].kv[..., :-1])
+    elif component == "key_up":
+        args[5] = args[5][..., :-1]
+    elif component == "query_rope":
+        args[1] = args[1][..., :-1]
+    else:
+        args[2] = args[2][:, :-1]
+    with pytest.raises(ValueError):
+        harness.attention.absorbed_mla(*args)
+
+
+def test_fusion_and_correction_formulas(harness):
+    model = make_model(harness)
+    anchor, target = torch.randn(2, 4), torch.randn(2, 4)
+    f = model.fusion
+    joined = torch.cat((f.embedding_norm(anchor), f.hidden_norm(target)), -1)
+    torch.testing.assert_close(f(anchor, target), anchor + f.gate * f.eh_proj(joined))
+    c = model.correction
+    z = torch.cat((c.hidden_norm(target), c.embedding_norm(anchor)), -1)
+    expected = target + c.down_proj(torch.nn.functional.silu(c.gate_proj(z)) * c.up_proj(z))
+    torch.testing.assert_close(c(target, anchor), expected)
+
+
+def test_deferred_linear_bias(harness):
+    class Deferred(nn.Module):
+        def forward(self, value):
+            return value * 2, torch.ones_like(value)
+
+    value = torch.randn(2, 4)
+    torch.testing.assert_close(harness.adapter.linear_output(Deferred(), value), value * 2 + 1)
+
+
+def test_fusion_only_slot_zero_and_five_distinct_contexts(harness):
+    p = make_proposer(harness)
+    seen = []
+    for layer in p.model.layers:
+        layer.register_forward_pre_hook(lambda module, args: seen.append((args[0].clone(), args[2].layer_id)))
+    propose(p)
+    inputs = p.model.embed_tokens(p.input_ids[:16].long()).view(2, 8, 4)
+    torch.testing.assert_close(seen[0][0][:, 1:], inputs[:, 1:])
+    torch.testing.assert_close(seen[0][0][:, 0], p.model.fusion(inputs[:, 0], p._target_final_hidden))
+    assert [layer for _, layer in seen] == [61, 65, 69, 73, 77]
+    for layer in p.model.layers:
+        torch.testing.assert_close(layer.attention.rotary.seen_positions, p.mrope_positions[:, :16].view(3, 2, 8))
+
+
+@torch.inference_mode()
+def test_serial_correction_uses_actual_predecessor(harness):
+    p = make_proposer(harness)
+    previous_embeddings, backbone_calls, corrected_seen = [], [], []
+    p.model.register_forward_hook(lambda *args: backbone_calls.append(True))
+    p.model.correction.register_forward_pre_hook(lambda module, args: previous_embeddings.append(args[1].clone()))
+    hook = p.model.confidence_head.register_forward_pre_hook(
+        lambda module, args: corrected_seen.append(args[0].clone())
+    )
+    ids = propose(p)
+    hook.remove()
+    assert ids.shape == (2, 7) and len(backbone_calls) == 1 and len(corrected_seen) == 7
+    torch.testing.assert_close(previous_embeddings[0], p.model.embed_tokens(torch.tensor([3, 4])))
+    for step in range(1, 7):
+        torch.testing.assert_close(previous_embeddings[step], p.model.embed_tokens(ids[:, step - 1]))
+    for step, hidden in enumerate(corrected_seen):
+        torch.testing.assert_close(p.confidence_logits[:, step], p.model.confidence_head(hidden).squeeze(-1))
+    assert p.verification_probs() is None
+
+
+def test_confidence_does_not_change_tokens_or_q(harness):
+    p = make_proposer(harness)
+    before = propose(p)
+    confidence = p.confidence_logits.clone()
+    with torch.no_grad():
+        p.model.confidence_head.bias.add_(100)
+    after = propose(p)
+    assert torch.equal(before, after)
+    torch.testing.assert_close(p.confidence_logits, confidence + 100)
+    assert p.verification_probs() is None
+    with pytest.raises(NotImplementedError, match="q storage"):
+        p.commit_draft_probs(after, torch.ones(2, 7, 9))
+
+
+def test_first_pass_rejections_logical_positions_and_read_only_cache(harness):
+    p = make_proposer(harness)
+    original = [cache.clone() for cache in p._target_model.caches]
+    cad = metadata()
+    count, indices, query, extra = p.set_inputs_first_pass(
+        None, torch.tensor([3, 4]), torch.full((3, 2), 999), None, None, cad, torch.tensor([1, 2])
+    )
+    assert count == 16 and extra is None and query.causal
+    assert indices.tolist() == list(range(1, 8)) + list(range(9, 16))
+    assert query.seq_lens.tolist() == [12, 15]
+    assert cad.seq_lens.tolist() == [5, 9] and cad.slot_mapping.tolist() == [888]
+    assert query.slot_mapping.tolist() == [-1] * 16
+    assert p._target_model.calls[0][1].tolist() == [4, 7]
+    assert p.mrope_positions[:, 0].tolist() == [14, 24, 34]
+    assert p.input_ids[:16].view(2, 8)[:, 1:].eq(120009).all()
+    p._run_merged_draft(16, 2, indices, None, None, [], 16)
+    for before, after in zip(original, p._target_model.caches):
+        torch.testing.assert_close(before, after)
+    assert not hasattr(p, "_context_slot_mapping_buffer")
+    assert not p.eagle3_use_aux_hidden_state
+    assert isinstance(p, harness.parent)
+
+
+def test_request_reordering_changes_context_binding(harness):
+    p = make_proposer(harness)
+    propose(p, (5, 5))
+    before = p._contexts[0].kv.clone()
+    p.runner.input_batch.req_ids = ["b", "a"]
+    propose(p, (5, 5))
+    torch.testing.assert_close(p._contexts[0].kv, before.flip(0))
+    assert p.confidence_request_ids == ("b", "a")
+
+
+def test_dummy_uses_masked_context_and_no_live_target(harness):
+    p = make_proposer(harness)
+    p.dummy_run(16, num_reqs=2, is_profile=True)
+    assert not p._target_model.calls
+    assert p.confidence_logits is None and not p.confidence_request_ids
+    assert len(p._contexts) == 5 and p._contexts[0].kv.shape == (2, 2056, 9)
+    assert not p._contexts[0].valid.any()
+    assert harness.events[-1]["in_profile_run"]
+    assert harness.events[-1]["aclgraph_runtime_mode"] is GraphMode.NONE
+
+
+def test_model_load_bridge_and_target_cache_groups(harness):
+    p = make_proposer(harness)
+    model, target = p.model, p._target_model
+    p._get_model = lambda: SimpleNamespace(to_hy_dflash_adapter=lambda supplied: model if supplied is target else None)
+    p.load_model(target)
+    assert p.model is model and p.draft_attn_groups == [] and p._draft_attn_layer_names == set()
+    groups = [SimpleNamespace(layer_names=[name]) for name in p.attn_layer_names]
+    p.initialize_attn_backend(SimpleNamespace(kv_cache_groups=groups), 4)
+    assert p.target_kv_cache_group_ids == (0, 1, 2, 3, 4) and p.kv_cache_gid == 0
+    with pytest.raises(ValueError, match="exactly one"):
+        p.initialize_attn_backend(SimpleNamespace(kv_cache_groups=groups[:-1]), 4)
+
+
+@pytest.mark.parametrize("missing", ["target", "draft"])
+def test_missing_vendor_bridge_fails_explicitly(harness, missing):
+    p = make_proposer(harness)
+    p._get_model = lambda: nn.Identity()
+    with pytest.raises(TypeError, match="expose|to_hy_dflash_adapter"):
+        p.load_model(nn.Identity() if missing == "target" else p._target_model)
 
 
 @pytest.mark.parametrize(
-    "name",
+    "field,value",
+    [
+        ("num_speculative_tokens", 6),
+        ("parallel_drafting", False),
+        ("method", "eagle3"),
+        ("enforce_eager", False),
+        ("draft_tensor_parallel_size", 2),
+    ],
+)
+def test_unsupported_spec_config(harness, field, value):
+    cfg = config()
+    setattr(cfg.speculative_config, field, value)
+    with pytest.raises((ValueError, NotImplementedError)):
+        harness.cls(cfg, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    "field",
     [
         "tensor_parallel_size",
         "pipeline_parallel_size",
@@ -393,57 +565,40 @@ def test_dummy_empty_batch_is_noop(harness):
         "decode_context_parallel_size",
     ],
 )
-def test_distributed_configuration_fails_closed(harness, name):
+def test_distributed_not_silently_supported(harness, field):
     cfg = config()
-    setattr(cfg.parallel_config, name, 2)
-    with pytest.raises(NotImplementedError, match=name):
-        harness.cls._validate_config(cfg)
+    setattr(cfg.parallel_config, field, 2)
+    with pytest.raises(NotImplementedError, match=field):
+        harness.cls(cfg, torch.device("cpu"))
 
 
-@pytest.mark.parametrize(
-    "field,value,error",
-    [
-        ("enforce_eager", False, NotImplementedError),
-        ("parallel_drafting", False, ValueError),
-        ("method", "mtp", ValueError),
-        ("draft_tensor_parallel_size", 2, NotImplementedError),
-    ],
-)
-def test_unsupported_draft_configuration(harness, field, value, error):
+def test_wrong_mask_and_lora_rejected(harness):
     cfg = config()
-    setattr(cfg.speculative_config, field, value)
-    with pytest.raises(error):
-        harness.cls._validate_config(cfg)
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config["mask_token_id"] = 7
+    with pytest.raises(ValueError, match="120009"):
+        harness.cls(cfg, torch.device("cpu"))
+    cfg = config()
+    cfg.lora_config = object()
+    with pytest.raises(NotImplementedError, match="LoRA"):
+        harness.cls(cfg, torch.device("cpu"))
 
 
-def test_contract_and_ihc_errors(harness):
-    proposer = make_proposer(harness)
-    proposer._validate_model_contract()
-    proposer.model.hy_dflash_contract_version = 0
-    with pytest.raises(ValueError, match="external model"):
-        proposer._validate_model_contract()
-    proposer.model.hy_dflash_contract_version = 1
-    proposer.model.select_hidden_path = None
-    with pytest.raises(TypeError, match="select_hidden_path"):
-        proposer._validate_model_contract()
-    with pytest.raises(ValueError, match="IHC"):
-        proposer._combine_target_hidden_states(torch.zeros(2, 4, 4))
+@pytest.mark.parametrize("bad", ["layers", "positions", "hidden"])
+def test_target_contract_shapes(harness, bad):
+    p = make_proposer(harness)
+    provider = p._target_model.get_hy_dflash_context
 
+    def broken(**kwargs):
+        state = provider(**kwargs)
+        if bad == "layers":
+            return replace(state, layers=state.layers[::-1])
+        if bad == "positions":
+            return replace(state, query_positions=state.query_positions[0])
+        return replace(state, final_hidden=state.final_hidden[:, :3])
 
-def test_stochastic_probabilities_are_not_silently_used(harness):
-    proposer = make_proposer(harness)
-    ids = torch.zeros(2, 2, dtype=torch.long)
-    assert proposer.commit_draft_probs(ids, None) is ids
-    with pytest.raises(NotImplementedError, match="Stochastic"):
-        proposer.commit_draft_probs(ids, torch.ones(2, 2, 5) / 5)
-
-
-def test_sparse_topk_is_not_shared_with_target(harness):
-    proposer = make_proposer(harness)
-    sentinel = object()
-    proposer.model.model = SimpleNamespace(topk_indices_buffer=sentinel)
-    proposer._maybe_share_topk_indices(SimpleNamespace(model=SimpleNamespace(topk_indices_buffer=object())))
-    assert proposer.model.model.topk_indices_buffer is sentinel
+    p._target_model.get_hy_dflash_context = broken
+    with pytest.raises(ValueError):
+        propose(p)
 
 
 def test_factory_is_explicit_opt_in(harness, monkeypatch):
@@ -457,140 +612,57 @@ def test_factory_is_explicit_opt_in(harness, monkeypatch):
     ):
         harness.register(f"vllm_ascend.spec_decode.{module_name}", **{class_name: Mock()})
     factory = harness.load("vllm_ascend.spec_decode", "vllm_ascend/spec_decode/__init__.py")
-    regular, hy = Mock(return_value="regular"), Mock(return_value="hy")
-    monkeypatch.setattr(factory, "AscendDflashProposer", regular)
-    monkeypatch.setattr(factory, "AscendHYDflashProposer", hy)
+    monkeypatch.setattr(factory, "AscendDflashProposer", Mock(return_value="regular"))
+    monkeypatch.setattr(factory, "AscendHYDflashProposer", Mock(return_value="hy"))
     cfg = config()
-    assert factory.get_spec_decode_method("dflash", cfg, "cpu", None) == "regular"
-    cfg.speculative_config.draft_model_config.hf_config.dflash_config["ascend_proposer"] = "hy"
     assert factory.get_spec_decode_method("dflash", cfg, "cpu", None) == "hy"
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config.pop("ascend_proposer")
+    assert factory.get_spec_decode_method("dflash", cfg, "cpu", None) == "regular"
 
 
-def test_runner_passes_draft_q_but_keeps_target_logits(harness):
-    proposer = make_proposer(harness)
-    logits, metadata = torch.randn(6, 5), object()
+@pytest.mark.parametrize("use_hy", [False, True])
+def test_runner_preserves_target_logits_and_never_passes_confidence_as_q(harness, use_hy):
+    proposer = make_proposer(harness) if use_hy else object()
+    if use_hy:
+        proposer.confidence_logits = torch.ones(2, 7)
+    logits, spec_metadata = torch.randn(16, 9), object()
     sampling = SimpleNamespace(top_k=None)
     runner = SimpleNamespace(
         drafter=proposer,
         input_batch=SimpleNamespace(sampling_metadata=sampling, update_async_output_token_ids=Mock()),
         rejection_sampler=Mock(return_value="verified"),
     )
-    method = source_methods(
-        harness.root / "vllm_ascend/worker/model_runner_v1.py",
-        "NPUModelRunner",
-        ["_sample"],
-        dict(AscendHYDflashProposer=harness.cls, lmhead_tp_enable=lambda: False),
-    )["_sample"]
-    assert method(runner, logits, metadata) == "verified"
-    runner.rejection_sampler.assert_called_once_with(metadata, None, logits, sampling)
+    path = harness.root / "vllm_ascend/worker/model_runner_v1.py"
+    tree = ast.parse(path.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_sample")
+    namespace = dict(AscendHYDflashProposer=harness.cls, lmhead_tp_enable=lambda: False)
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]), str(path), "exec", flags=__future__.annotations.compiler_flag
+        ),
+        namespace,
+    )
+    assert namespace["_sample"](runner, logits, spec_metadata) == "verified"
+    runner.rejection_sampler.assert_called_once_with(spec_metadata, None, logits, sampling)
 
 
-@pytest.mark.parametrize(
-    "field,value,message",
-    [
-        ("target_positions", torch.zeros(3, 7), "one position"),
-        ("target_hidden_states", torch.zeros(7, 4, 4), "context must"),
-        ("target_token_ids", torch.zeros(17), "context buffer"),
-        ("target_token_ids", torch.zeros(0), "at least one"),
-        ("next_token_ids", torch.zeros(1), "one anchor"),
-        ("num_rejected_tokens_gpu", torch.zeros(1), "rejected-token count"),
-    ],
-)
-def test_input_shape_errors_precede_any_cache_write(harness, field, value, message):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    inputs[field] = value
-    with pytest.raises(ValueError, match=message):
-        proposer.set_inputs_first_pass(**inputs)
-    assert harness.events == []
-
-
-@pytest.mark.parametrize("num_reqs", [0, 5])
-def test_batch_capacity_errors(harness, num_reqs):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    inputs["cad"].num_reqs = num_reqs
-    with pytest.raises(ValueError, match="max_batch_size"):
-        proposer.set_inputs_first_pass(**inputs)
-
-
-def test_query_start_shape_error(harness):
-    proposer = make_proposer(harness)
-    inputs = batch()
-    inputs["cad"].query_start_loc = torch.tensor([0, 4, 7, 7])
-    with pytest.raises(ValueError, match="unpadded"):
-        proposer.set_inputs_first_pass(**inputs)
-
-
-@pytest.mark.parametrize("num_tokens", [-1, 13])
-def test_query_input_capacity_errors(harness, num_tokens):
-    proposer = make_proposer(harness)
-    with pytest.raises(ValueError, match="query buffer"):
-        proposer.build_model_inputs_first_pass(num_tokens)
-
-
-def run_query(harness, proposer):
-    with harness.context(None, proposer.vllm_config, aclgraph_runtime_mode=GraphMode.NONE):
-        return proposer._run_merged_draft(6, 2, None, None, None, [], 6)
-
-
-@pytest.mark.parametrize("output", [torch.zeros(6, 2, 4), torch.zeros(5, 4), (torch.zeros(6, 4),)])
-def test_model_output_contract_failure(harness, monkeypatch, output):
-    proposer = make_proposer(harness)
-    monkeypatch.setattr(ToyModel, "__call__", lambda *args, **kwargs: output)
-    with pytest.raises(ValueError, match="without IHC"):
-        run_query(harness, proposer)
-
-
-def test_path_selection_shape_failure(harness):
-    proposer = make_proposer(harness)
-    proposer.model.select_hidden_path = lambda *args: torch.zeros(2, 2, 4)
-    with pytest.raises(ValueError, match="path selector"):
-        run_query(harness, proposer)
+@pytest.mark.parametrize("num_tokens", [-1, 0, 9, 40])
+def test_query_block_capacity_guards(harness, num_tokens):
+    with pytest.raises(ValueError, match="complete 8-slot"):
+        make_proposer(harness).build_model_inputs_first_pass(num_tokens)
 
 
 @pytest.mark.parametrize("output", [None, torch.zeros(2, 3, 4), torch.zeros(3, 5)])
 def test_lm_head_shape_failure(harness, output):
-    proposer = make_proposer(harness)
-    proposer.model.compute_logits = lambda *args: output
+    p = make_proposer(harness)
+    p.model.compute_logits = lambda *args: output
     with pytest.raises(ValueError, match="LM head"):
-        run_query(harness, proposer)
+        propose(p)
 
 
-@pytest.mark.parametrize(
-    "method,model_type", [("eagle3", "Eagle3LlamaForCausalLM"), ("dflash", "DFlashQwen3ForCausalLM")]
-)
-def test_default_hidden_combination_preserves_model_guard(harness, method, model_type):
-    proposer = harness.parent.__new__(harness.parent)
-    proposer.method, proposer.hidden_size = method, 4
-    proposer.model = harness.config_globals[model_type]()
-    hidden = torch.zeros(3, 4)
-    proposer.model.combine_hidden_states = Mock(return_value=hidden + 1)
-    torch.testing.assert_close(proposer._combine_target_hidden_states(hidden), hidden + 1)
-    proposer.model = ToyModel([])
-    with pytest.raises(AssertionError):
-        proposer._combine_target_hidden_states(hidden)
-
-
-def test_mtp_hidden_combination_is_unchanged(harness):
-    proposer = harness.parent.__new__(harness.parent)
-    proposer.method = "mtp"
-    hidden = torch.zeros(3, 4)
-    assert proposer._combine_target_hidden_states(hidden) is hidden
-
-
-def test_lora_is_rejected(harness):
-    cfg = config()
-    cfg.lora_config = object()
-    with pytest.raises(NotImplementedError, match="LoRA"):
-        harness.cls._validate_config(cfg)
-
-
-def test_next_round_replaces_rejected_slot_mask(harness):
-    proposer = make_proposer(harness)
-    proposer.set_inputs_first_pass(**batch())
-    inputs = batch()
-    inputs["num_rejected_tokens_gpu"] = None
-    proposer.set_inputs_first_pass(**inputs)
-    assert (proposer._context_slot_mapping_buffer[:7] >= 0).all()
-    torch.testing.assert_close(proposer.model.caches[0][32], inputs["target_hidden_states"][2])
+def test_confidence_head_shape_failure(harness):
+    p = make_proposer(harness)
+    p.model.confidence_head = nn.Linear(4, 2)
+    with pytest.raises(ValueError, match="confidence head"):
+        propose(p)

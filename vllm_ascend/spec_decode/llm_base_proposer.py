@@ -556,13 +556,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
-    def _combine_target_hidden_states(self, target_hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.method in ("eagle3", "dflash"):
-            assert isinstance(self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM))
-            target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
-            assert target_hidden_states.shape[-1] == self.hidden_size
-        return target_hidden_states
-
     def _propose(
         self,
         # [num_tokens]
@@ -591,7 +584,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if token_indices_to_sample is None:
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
 
-        target_hidden_states = self._combine_target_hidden_states(target_hidden_states)
+        if self.method in ("eagle3", "dflash"):
+            assert isinstance(self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM))
+            target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+            assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
