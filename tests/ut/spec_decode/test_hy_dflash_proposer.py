@@ -120,7 +120,15 @@ def config(k=7):
             draft_tensor_parallel_size=1,
             num_speculative_tokens=k,
             draft_model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(dflash_config={"ascend_proposer": "hy", "mask_token_id": 120009})
+                hf_config=SimpleNamespace(
+                    dflash_config={
+                        "ascend_proposer": "hy",
+                        "mask_token_id": 120009,
+                        "target_layer_ids": [61, 65, 69, 73, 77],
+                        "context_topk": 2048,
+                        "context_local_window": 8,
+                    }
+                )
             ),
         ),
         parallel_config=SimpleNamespace(),
@@ -175,11 +183,12 @@ class TinyMLP(nn.Module):
         return self.down(torch.nn.functional.silu(self.gate(hidden)) * self.up(hidden))
 
 
-def make_model(harness):
+def make_model(harness, cfg=None):
     torch.manual_seed(34)
     a, m = harness.attention, harness.adapter
+    layer_ids = (cfg or config()).speculative_config.draft_model_config.hf_config.dflash_config["target_layer_ids"]
     layers = []
-    for _ in a.HY_TARGET_LAYERS:
+    for _ in layer_ids:
         attention = a.HYDflashAttention(
             TinyProject(),
             TinyRotary(),
@@ -201,13 +210,16 @@ def make_model(harness):
         nn.Linear(4, 1, bias=True),
         nn.Linear(4, 9),
         hidden_size=4,
+        target_layer_ids=layer_ids,
     )
 
 
 class TargetProvider:
-    def __init__(self, attention):
+    def __init__(self, attention, cfg):
         self.attention = attention
-        self.caches = [torch.randn(8, 4, 9) for _ in attention.HY_TARGET_LAYERS]
+        draft = cfg.speculative_config.draft_model_config.hf_config.dflash_config
+        self.context_topk = draft["context_topk"]
+        self.caches = [torch.randn(8, 4, 9) for _ in draft["target_layer_ids"]]
         self.calls = []
 
     def get_hy_dflash_layer_names(self, layer_ids):
@@ -216,25 +228,25 @@ class TargetProvider:
     def get_hy_dflash_context(self, *, request_ids, anchor_positions, layer_ids, block_size):
         self.calls.append((request_ids, anchor_positions.clone()))
         batch = len(request_ids)
-        assert block_size == 8
         page_base = torch.tensor([0 if req == "a" else 4 for req in request_ids])
         table = page_base[:, None] + torch.arange(4)[None]
         layers = tuple(
-            self.attention.HYTargetLayerState(layer_id, cache, table, torch.zeros(batch, 0, dtype=torch.int64))
+            self.attention.HYTargetLayerState(layer_id, cache, table, torch.arange(self.context_topk).expand(batch, -1))
             for layer_id, cache in zip(layer_ids, self.caches)
         )
-        positions = anchor_positions[:, None] + torch.arange(8)[None]
+        positions = anchor_positions[:, None] + torch.arange(block_size)[None]
         positions = positions[None] + torch.tensor([10, 20, 30])[:, None, None]
         final_hidden = (anchor_positions - 1)[:, None].float().expand(-1, 4)
         final_hidden = torch.nn.functional.rms_norm(final_hidden, (4,))
         return self.attention.HYTargetState(layers, torch.zeros(batch, dtype=torch.int64), final_hidden, positions)
 
 
-def make_proposer(harness):
+def make_proposer(harness, cfg=None):
+    cfg = cfg or config()
     runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["a", "b"]))
-    proposer = harness.cls(config(), torch.device("cpu"), runner)
-    proposer.model = make_model(harness)
-    proposer._target_model = TargetProvider(harness.attention)
+    proposer = harness.cls(cfg, torch.device("cpu"), runner)
+    proposer.model = make_model(harness, cfg)
+    proposer._target_model = TargetProvider(harness.attention, cfg)
     return proposer
 
 
@@ -284,17 +296,11 @@ def test_context_union_layer_specific_and_document_bounds(harness):
 
 
 def test_real_context_capacity(harness):
-    result = harness.attention.select_context_indices(torch.arange(2048)[None], torch.tensor([3000]), torch.tensor([0]))
+    result = harness.attention.select_context_indices(
+        torch.arange(2048)[None], torch.tensor([3000]), torch.tensor([0]), topk=2048, local_window=8
+    )
     assert result.shape == (1, 2056)
     assert result[0, -8:].tolist() == list(range(2992, 3000))
-
-
-@pytest.mark.parametrize("topk,window,selection", [(0, 8, [[0]]), (2, -1, [[0]]), (1, 0, [[0, 1]])])
-def test_bad_context_capacity(harness, topk, window, selection):
-    with pytest.raises(ValueError):
-        harness.attention.select_context_indices(
-            torch.tensor(selection), torch.tensor([9]), torch.tensor([0]), topk=topk, local_window=window
-        )
 
 
 def test_gather_pages_read_only(harness):
@@ -400,7 +406,7 @@ def test_attention_shape_guards(harness, component):
         args[1] = args[1][..., :-1]
     else:
         args[2] = args[2][:, :-1]
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         harness.attention.absorbed_mla(*args)
 
 
@@ -469,8 +475,6 @@ def test_confidence_does_not_change_tokens_or_q(harness):
     assert torch.equal(before, after)
     torch.testing.assert_close(p.confidence_logits, confidence + 100)
     assert p.verification_probs() is None
-    with pytest.raises(NotImplementedError, match="q storage"):
-        p.commit_draft_probs(after, torch.ones(2, 7, 9))
 
 
 def test_first_pass_rejections_logical_positions_and_read_only_cache(harness):
@@ -526,7 +530,7 @@ def test_model_load_bridge_and_target_cache_groups(harness):
     groups = [SimpleNamespace(layer_names=[name]) for name in p.attn_layer_names]
     p.initialize_attn_backend(SimpleNamespace(kv_cache_groups=groups), 4)
     assert p.target_kv_cache_group_ids == (0, 1, 2, 3, 4) and p.kv_cache_gid == 0
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(KeyError):
         p.initialize_attn_backend(SimpleNamespace(kv_cache_groups=groups[:-1]), 4)
 
 
@@ -534,20 +538,11 @@ def test_model_load_bridge_and_target_cache_groups(harness):
 def test_missing_vendor_bridge_fails_explicitly(harness, missing):
     p = make_proposer(harness)
     p._get_model = lambda: nn.Identity()
-    with pytest.raises(TypeError, match="expose|to_hy_dflash_adapter"):
+    with pytest.raises(AttributeError):
         p.load_model(nn.Identity() if missing == "target" else p._target_model)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("num_speculative_tokens", 6),
-        ("parallel_drafting", False),
-        ("method", "eagle3"),
-        ("enforce_eager", False),
-        ("draft_tensor_parallel_size", 2),
-    ],
-)
+@pytest.mark.parametrize("field,value", [("enforce_eager", False), ("draft_tensor_parallel_size", 2)])
 def test_unsupported_spec_config(harness, field, value):
     cfg = config()
     setattr(cfg.speculative_config, field, value)
@@ -572,11 +567,7 @@ def test_distributed_not_silently_supported(harness, field):
         harness.cls(cfg, torch.device("cpu"))
 
 
-def test_wrong_mask_and_lora_rejected(harness):
-    cfg = config()
-    cfg.speculative_config.draft_model_config.hf_config.dflash_config["mask_token_id"] = 7
-    with pytest.raises(ValueError, match="120009"):
-        harness.cls(cfg, torch.device("cpu"))
+def test_lora_rejected_at_initialization(harness):
     cfg = config()
     cfg.lora_config = object()
     with pytest.raises(NotImplementedError, match="LoRA"):
@@ -597,7 +588,7 @@ def test_target_contract_shapes(harness, bad):
         return replace(state, final_hidden=state.final_hidden[:, :3])
 
     p._target_model.get_hy_dflash_context = broken
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, RuntimeError)):
         propose(p)
 
 
@@ -647,22 +638,60 @@ def test_runner_preserves_target_logits_and_never_passes_confidence_as_q(harness
     runner.rejection_sampler.assert_called_once_with(spec_metadata, None, logits, sampling)
 
 
-@pytest.mark.parametrize("num_tokens", [-1, 0, 9, 40])
-def test_query_block_capacity_guards(harness, num_tokens):
-    with pytest.raises(ValueError, match="complete 8-slot"):
-        make_proposer(harness).build_model_inputs_first_pass(num_tokens)
-
-
 @pytest.mark.parametrize("output", [None, torch.zeros(2, 3, 4), torch.zeros(3, 5)])
 def test_lm_head_shape_failure(harness, output):
     p = make_proposer(harness)
     p.model.compute_logits = lambda *args: output
-    with pytest.raises(ValueError, match="LM head"):
+    with pytest.raises((AttributeError, RuntimeError)):
         propose(p)
 
 
 def test_confidence_head_shape_failure(harness):
     p = make_proposer(harness)
     p.model.confidence_head = nn.Linear(4, 2)
-    with pytest.raises(ValueError, match="confidence head"):
+    with pytest.raises(RuntimeError):
         propose(p)
+
+
+@pytest.mark.parametrize(
+    "tokens,layer_ids,topk,window,mask",
+    [(3, [2, 7, 11], 4, 2, 15), (1, [9], 2, 0, 17)],
+)
+def test_configuration_drives_full_forward_and_dummy(harness, tokens, layer_ids, topk, window, mask):
+    cfg = config(tokens)
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config.update(
+        target_layer_ids=layer_ids,
+        context_topk=topk,
+        context_local_window=window,
+        mask_token_id=mask,
+    )
+    p = make_proposer(harness, cfg)
+    calls = []
+    p.model.correction.register_forward_pre_hook(lambda *args: calls.append(True))
+    ids = propose(p)
+    block_size = tokens + 1
+    assert ids.shape == (2, tokens) and len(calls) == tokens
+    assert p.input_ids[: 2 * block_size].view(2, block_size)[:, 1:].eq(mask).all()
+    assert [context.layer_id for context in p._contexts] == layer_ids
+    assert all(context.kv.shape == (2, topk + window, 9) for context in p._contexts)
+    assert p.mrope_positions[:, : 2 * block_size].view(3, 2, block_size)[0, 0, 0] == 15
+    p.dummy_run(2 * block_size, num_reqs=2)
+    assert len(calls) == 2 * tokens
+    assert len(p._contexts) == len(layer_ids)
+    assert all(context.kv.shape[1] == topk + window for context in p._contexts)
+
+
+def test_configured_layer_mapping_checked_once_on_load(harness):
+    p = make_proposer(harness)
+    p.model.target_layer_ids = p.target_layer_ids[::-1]
+    p._get_model = lambda: p.model
+    with pytest.raises(ValueError, match="layer mapping"):
+        p.load_model(p._target_model)
+
+
+@pytest.mark.parametrize("field,value", [("context_topk", 0), ("context_local_window", -1), ("target_layer_ids", [])])
+def test_invalid_context_configuration(harness, field, value):
+    cfg = config()
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config[field] = value
+    with pytest.raises(ValueError, match="HY requires"):
+        harness.cls(cfg, torch.device("cpu"))

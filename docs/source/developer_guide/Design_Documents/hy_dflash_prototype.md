@@ -20,6 +20,11 @@ integration checks pass.
 
 ## Architecture
 
+The values below describe the supplied checkpoint, not runtime constants.
+Layer mapping and context selection come from the draft HF configuration;
+block length is `num_speculative_tokens + 1`, and the mask token is read by
+the existing DFlash parent. Hidden size comes from the loaded model.
+
 | Component | Required behavior |
 | --- | --- |
 | Backbone | Five dense layers; hidden 6144; SwiGLU 6144 → 18432 → 6144 |
@@ -61,8 +66,8 @@ gather, absorbed MLA math and attention composition.
 Logical token offsets are separate from M-RoPE coordinates. Context candidates
 are filtered to the same document and strictly before the anchor, sorted and
 deduplicated. Documents with at most 2048 visible context tokens explicitly use
-their entire prefix. The fixed gather capacity is 2056, with invalid entries
-masked; the current block's eight keys are separate and never sparsified.
+their entire prefix. The gather capacity is `context_topk + context_local_window` (2056 here),
+with invalid entries masked; the current block's eight keys are separate and never sparsified.
 
 For each layer:
 
@@ -111,8 +116,9 @@ monkey-patching or a new model registration:
   Norm/MLP modules receive flattened token rows.
 - `HYHiddenCorrection`: `h + down(silu(gate(z)) * up(z))`, with
   `z = norm(h) || norm(E(previous_token))`.
-- `HYDflashAdapter`: exactly five layers, final norm, correction, LM-head
-  callback and independent confidence head.
+- `HYDflashAdapter`: loaded layers, final norm, correction, LM-head callback
+  and independent confidence head. Pass `hidden_size` and `target_layer_ids`
+  from the model configuration; the loader checks their alignment once.
 
 Pass loaded checkpoint modules and weights to these constructors. Do not
 randomly initialize fusion/correction/confidence for inference: “random
@@ -136,14 +142,14 @@ cache layers. Current-block KV stays inside the attention forward.
 The target exposes two read-only methods:
 
 ```python
-get_hy_dflash_layer_names(layer_ids=(61, 65, 69, 73, 77))
+get_hy_dflash_layer_names(layer_ids)
 
 get_hy_dflash_context(
     *,
     request_ids,
     anchor_positions,
-    layer_ids=(61, 65, 69, 73, 77),
-    block_size=8,
+    layer_ids,
+    block_size,
 ) -> HYTargetState
 ```
 
@@ -193,7 +199,7 @@ ordinary DFlash's projected-context execution.
 | `build_model_inputs_first_pass` | Pass blocks, 3-D positions, final hidden and five contexts |
 | `_propose` | Enter eager draft context, bypass shared single-layer metadata builder |
 | `_run_merged_draft` | Run backbone once, then seven sequential correction/head steps |
-| `commit_draft_probs` | Publish deterministic proposals; reject unsupported random q |
+| `commit_draft_probs` | Publish greedy proposals with delta q; no unused random-q argument |
 | `verification_probs` | Return actual draft q only; never confidence |
 | `dummy_run` | Profile draft math with masked contexts and no live target cache access |
 
@@ -236,14 +242,27 @@ The loaded draft HF configuration opts in explicitly:
 {
   "dflash_config": {
     "ascend_proposer": "hy",
-    "mask_token_id": 120009
+    "mask_token_id": 120009,
+    "target_layer_ids": [61, 65, 69, 73, 77],
+    "context_topk": 2048,
+    "context_local_window": 8
   }
 }
 ```
 
-Use speculative method `dflash`, parallel drafting, exactly seven speculative
-tokens, and speculative `enforce_eager=true`. This is a configuration fragment,
+For this checkpoint use speculative method `dflash`, parallel drafting, seven
+speculative tokens, and speculative `enforce_eager=true`. This is a configuration fragment,
 not a complete model configuration or a standalone serving command.
+The context fields shown are required bridge configuration, not assumed vendor
+checkpoint field names. A vendor loader should map its native metadata to these
+fields. Alternate checkpoints may supply different layer counts, masks and
+block lengths; changing a serving flag does not retrain a fixed-block checkpoint.
+
+Internal tensor shapes are handled by their tensor operations rather than
+repeated Python type/shape checks. Remaining explicit checks are at meaningful
+boundaries: context configuration, loaded layer mapping, returned layer order,
+floating-point cache format and allocated cache addresses. Unsupported execution
+capabilities are reported together once at initialization.
 
 TP, DP, PP, PCP and DCP must all be 1; draft TP must be 1. LoRA and separate
 LM-head TP are rejected. Other DFlash models remain on their original path.
@@ -268,7 +287,9 @@ correction and five-layer composition with tiny loaded modules. They include
 an independent expanded-K/V attention reference in FP32/BF16, causal and batch
 isolation, context union/bounds, physical-page lookup, read-only cache, 3-D
 positions, serial predecessor tokens, confidence isolation, factory routing,
-runner verification and unsupported-mode guards.
+runner verification and unsupported-mode guards. End-to-end tiny-model tests
+also vary layer count/mapping, mask ID, speculative length, top-k and local
+window (including zero), through both live forward and dummy profiling.
 
 The vLLM/Ascend infrastructure is mocked; the runner sampling method is loaded
 from its source AST. These are not full runner, Triton, HY4 checkpoint or NPU

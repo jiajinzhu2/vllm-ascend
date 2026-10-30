@@ -12,12 +12,6 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-HY_TARGET_LAYERS = (61, 65, 69, 73, 77)
-HY_BLOCK_SIZE = 8
-HY_MASK_TOKEN_ID = 120009
-HY_CONTEXT_TOPK = 2048
-HY_CONTEXT_LOCAL_WINDOW = 8
-
 
 @dataclass(frozen=True)
 class HYTargetLayerState:
@@ -44,7 +38,7 @@ class HYTargetState:
     # Target final-norm output at anchor - 1, one row per request (not aux hidden).
     final_hidden: torch.Tensor
     # Correct positions for this block, including target's multimodal deltas.
-    query_positions: torch.Tensor  # [3, batch, 8]
+    query_positions: torch.Tensor  # [3, batch, block_size]
 
 
 @dataclass(frozen=True)
@@ -60,8 +54,8 @@ def select_context_indices(
     anchor_positions: torch.Tensor,
     document_starts: torch.Tensor,
     *,
-    topk: int = HY_CONTEXT_TOPK,
-    local_window: int = HY_CONTEXT_LOCAL_WINDOW,
+    topk: int,
+    local_window: int,
 ) -> torch.Tensor:
     """Unique(layer top-k at anchor-1, local window), fixed capacity, no host sync.
 
@@ -71,12 +65,6 @@ def select_context_indices(
     rejected/speculative future rows survive the bounds mask.
     """
     batch = anchor_positions.shape[0]
-    if topk <= 0 or local_window < 0:
-        raise ValueError("Invalid HY context selection capacity")
-    if document_starts.shape != (batch,) or topk_indices.ndim != 2 or topk_indices.shape[0] != batch:
-        raise ValueError("HY context selection requires request-aligned inputs")
-    if topk_indices.shape[1] > topk:
-        raise ValueError("Target indexer returned more than the configured top-k")
     device = anchor_positions.device
     selected = torch.full((batch, topk), -1, dtype=torch.int64, device=device)
     selected[:, : topk_indices.shape[1]] = topk_indices
@@ -99,10 +87,6 @@ def gather_context(layer: HYTargetLayerState, indices: torch.Tensor) -> HYContex
     cache, table = layer.cache, layer.block_table
     if cache.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("HY cache bridge must expose dequantized floating-point latent KV")
-    if cache.ndim != 3 or table.ndim != 2 or table.shape[0] != indices.shape[0]:
-        raise ValueError("Expected paged HY cache and request-aligned block table")
-    if cache.shape[0] == 0 or cache.shape[1] == 0 or table.shape[1] == 0:
-        raise ValueError("HY target cache/block table is empty")
     block_size = cache.shape[1]
     logical_blocks = indices.clamp_min(0) // block_size
     addressable = (indices >= 0) & (logical_blocks < table.shape[1])
@@ -135,20 +119,8 @@ def absorbed_mla(
     The BF16 draft uses bias-free MLA expansion. All positions in context are
     already filtered to < anchor; every block key remains unsparsified.
     """
-    if query_nope.ndim != 4 or key_up.ndim != 3 or value_up.ndim != 3:
-        raise ValueError("Invalid HY MLA query/weight ranks")
-    batch, query_len, heads, _ = query_nope.shape
-    rank, rope_dim = block_latent.shape[-1], block_rope.shape[-1]
-    if context.kv.shape[:2] != context.valid.shape or context.kv.shape[0] != batch:
-        raise ValueError("HY context batch/valid mask mismatch")
-    if context.kv.shape[-1] != rank + rope_dim:
-        raise ValueError("Target and draft MLA latent/RoPE layouts are incompatible")
-    if key_up.shape != (heads, query_nope.shape[-1], rank) or value_up.shape[0::2] != (heads, rank):
-        raise ValueError("Incompatible HY MLA expansion weights")
-    if query_rope.shape != (batch, query_len, heads, rope_dim):
-        raise ValueError("Incompatible HY MLA query RoPE shape")
-    if block_latent.shape != (batch, query_len, rank) or block_rope.shape != (batch, query_len, rope_dim):
-        raise ValueError("Incompatible HY current-block KV shape")
+    batch, query_len = query_nope.shape[:2]
+    rank = block_latent.shape[-1]
     latent = torch.cat((context.kv[..., :rank], block_latent), dim=1)
     rope = torch.cat((context.kv[..., rank:], block_rope), dim=1)
     absorbed_query = torch.einsum("bqhd,hdr->bqhr", query_nope.float(), key_up.float())

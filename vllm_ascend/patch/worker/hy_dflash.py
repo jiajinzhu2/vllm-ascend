@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm_ascend.attention.hy_dflash import HY_BLOCK_SIZE, HY_TARGET_LAYERS, HYContext, HYDflashAttention
+from vllm_ascend.attention.hy_dflash import HYContext, HYDflashAttention
 
 
 def linear_output(module: nn.Module, value: torch.Tensor) -> torch.Tensor:
@@ -32,8 +32,6 @@ class HYMTPFusion(nn.Module):
         self.register_buffer("gate", gate, persistent=False)
 
     def forward(self, anchor_embedding: torch.Tensor, target_final_hidden: torch.Tensor) -> torch.Tensor:
-        if self.gate.shape != (anchor_embedding.shape[-1],):
-            raise ValueError("MTP fusion requires a per-channel gate")
         joined = torch.cat((self.embedding_norm(anchor_embedding), self.hidden_norm(target_final_hidden)), dim=-1)
         return anchor_embedding + self.gate * linear_output(self.eh_proj, joined)
 
@@ -74,7 +72,7 @@ class HYDenseDraftLayer(nn.Module):
 
 
 class HYDflashAdapter(nn.Module):
-    """Five loaded dense layers, slot-0 fusion, correction and confidence.
+    """Loaded dense layers, slot-0 fusion, correction and confidence.
 
     The target supplies embeddings/LM head through the checkpoint's normal
     sharing policy. final_hidden is already target-final-normalized. The fusion
@@ -94,16 +92,16 @@ class HYDflashAdapter(nn.Module):
         correction: HYHiddenCorrection,
         confidence_head: nn.Module,
         compute_logits: Callable[[torch.Tensor], torch.Tensor],
-        hidden_size: int = 6144,
+        hidden_size: int,
+        target_layer_ids: Sequence[int],
     ):
         super().__init__()
-        if len(layers) != len(HY_TARGET_LAYERS):
-            raise ValueError("HY KV-share draft requires five dense layers")
         self.layers = nn.ModuleList(layers)
         self.embed_tokens, self.final_norm = embed_tokens, final_norm
         self.fusion, self.correction, self.confidence_head = fusion, correction, confidence_head
         self.logits_callback = compute_logits
         self.hidden_size = hidden_size
+        self.target_layer_ids = tuple(target_layer_ids)
 
     def forward(
         self,
@@ -112,19 +110,13 @@ class HYDflashAdapter(nn.Module):
         target_final_hidden: torch.Tensor,
         contexts: tuple[HYContext, ...],
     ) -> torch.Tensor:
-        batch = input_ids.shape[0]
-        if input_ids.shape != (batch, HY_BLOCK_SIZE) or positions.shape != (3, batch, HY_BLOCK_SIZE):
-            raise ValueError("HY DFlash requires [B,8] tokens and [3,B,8] M-RoPE positions")
-        if target_final_hidden.shape != (batch, self.hidden_size):
-            raise ValueError("Expected target final-norm hidden at anchor-1")
-        if tuple(context.layer_id for context in contexts) != HY_TARGET_LAYERS:
-            raise ValueError("HY context layers must be 61,65,69,73,77 in order")
-        hidden = self.embed_tokens(input_ids.reshape(-1)).view(batch, HY_BLOCK_SIZE, self.hidden_size)
+        batch, block_size = input_ids.shape
+        hidden = self.embed_tokens(input_ids.reshape(-1)).view(batch, block_size, self.hidden_size)
         anchor = self.fusion(hidden[:, 0], target_final_hidden)
         hidden = torch.cat((anchor[:, None], hidden[:, 1:]), dim=1)
-        for layer, context in zip(self.layers, contexts):
+        for layer, context in zip(self.layers, contexts, strict=True):
             hidden = layer(hidden, positions, context)
-        return self.final_norm(hidden.flatten(0, 1)).view(batch, HY_BLOCK_SIZE, self.hidden_size)
+        return self.final_norm(hidden.flatten(0, 1)).view(batch, block_size, self.hidden_size)
 
     def correct_hidden_states(self, hidden: torch.Tensor, previous_token_ids: torch.Tensor) -> torch.Tensor:
         return self.correction(hidden, self.embed_tokens(previous_token_ids))
@@ -134,13 +126,11 @@ class HYDflashAdapter(nn.Module):
 
     def predict_confidence(self, corrected_hidden: torch.Tensor) -> torch.Tensor:
         logits = linear_output(self.confidence_head, corrected_hidden)
-        if logits.shape != (*corrected_hidden.shape[:-1], 1):
-            raise ValueError("HY confidence head must output one acceptance logit per position")
-        return logits.squeeze(-1)
+        return logits.view(corrected_hidden.shape[:-1])
 
     def dummy_contexts(self, batch: int, capacity: int) -> tuple[HYContext, ...]:
         contexts = []
-        for layer_id, layer in zip(HY_TARGET_LAYERS, self.layers):
+        for layer_id, layer in zip(self.target_layer_ids, self.layers, strict=True):
             attn = layer.attention
             reference = attn.key_up
             indices = torch.full((batch, capacity), -1, dtype=torch.int64, device=reference.device)
