@@ -419,20 +419,28 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.q_b_proj = kwargs["q_b_proj"]
         self.skip_topk = kwargs.get("skip_topk", False)
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
+        self.topk_capture_buffer = kwargs.get("topk_capture_buffer")
+        self.linear_gate = kwargs.get("linear_gate")
+        self.gating_type = kwargs.get("gating_type")
+        self.sinks = kwargs.get("sinks")
+        if self.sinks is not None:
+            logger.warning_once(
+                "The current Ascend sparse-MLA kernel cannot consume HY4 learnable sinks; "
+                "the parameter is loaded and retained for the sink-capable kernel path."
+            )
 
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+        self.vllm_config = get_current_vllm_config()
+        hf_config = self.vllm_config.model_config.hf_config
 
         # The MLAPO operator fuses the pre-processing steps on Q/K/V in MLA into a single operator
         # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm
-        self.enable_mlapo = get_ascend_config().enable_mlapo
-
-        assert self.indexer is not None, "Indexer is required for DSA."
+        self.enable_mlapo = get_ascend_config().enable_mlapo and not self.skip_topk
 
         self.local_num_heads = self.num_heads
-        self.vllm_config = get_current_vllm_config()
         self.use_index_cache = self.skip_topk or getattr(
-            self.vllm_config.model_config.hf_config,
+            hf_config,
             "use_index_cache",
             False,
         )
@@ -441,21 +449,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         self.layer_name = kwargs.get("layer_name")
 
-        # indexer param
-        self.n_head: int = self.indexer.n_head  # 64
-        self.head_dim: int = self.indexer.head_dim  # 128
-        self.wq_b = self.indexer.wq_b
-        self.wk_weights_proj = self.indexer.wk_weights_proj
-        self.k_norm = self.indexer.k_norm
+        # Shared-indexer layers consume the preceding full layer's top-k and do
+        # not own indexer weights/cache.  Full layers retain the existing path.
+        self.n_head = self.indexer.n_head if self.indexer is not None else hf_config.index_n_heads
+        self.head_dim = self.indexer.head_dim if self.indexer is not None else hf_config.index_head_dim
+        self.topk_tokens = self.indexer.topk_tokens if self.indexer is not None else hf_config.index_topk
+        self.wq_b = self.indexer.wq_b if self.indexer is not None else None
+        self.wk_weights_proj = self.indexer.wk_weights_proj if self.indexer is not None else None
+        self.k_norm = self.indexer.k_norm if self.indexer is not None else None
         self.cp_size = 1
         self.is_rope_neox_style = True
+        self.indexer_rope_at_end = getattr(hf_config, "indexer_rope_at_end", hf_config.model_type == "hy_v4")
         self.use_torch_npu_lightning_indexer = False
-        if self.vllm_config.model_config.hf_config.model_type in ["glm_moe_dsa"]:
+        if hf_config.model_type in ["glm_moe_dsa", "hy_v4"]:
             self.is_rope_neox_style = False
             self.use_torch_npu_lightning_indexer = True
 
         # dsa c8
-        self.use_sparse_c8_indexer = ascend_config.is_sparse_c8_layer(self.layer_name)
+        self.use_sparse_c8_indexer = not self.skip_topk and ascend_config.is_sparse_c8_layer(self.layer_name)
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
@@ -850,6 +861,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
         return x
 
+    def _apply_output_gate(self, hidden_states: torch.Tensor, attn_output: torch.Tensor) -> torch.Tensor:
+        if self.linear_gate is None:
+            return attn_output
+        gate = torch.sigmoid(self.linear_gate(hidden_states)[0])
+        if self.gating_type == "headwise":
+            gate = gate.unsqueeze(-1)
+            shaped = attn_output.view(*attn_output.shape[:-1], -1, self.v_head_dim)
+            return (shaped * gate).flatten(-2)
+        return attn_output * gate
+
     def _sfa_preprocess_with_mlapo(
         self,
         hidden_states: torch.Tensor,
@@ -909,36 +930,40 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return hidden_states, ql_nope, q_pe, q_c
 
+    def _apply_indexer_rope(self, value: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Rotate the checkpoint's physical RoPE slice without changing layout."""
+        if HAS_TRITON and not self.indexer_rope_at_end:
+            return rope_forward_triton_siso(
+                value,
+                cos.view(-1, self.qk_rope_head_dim),
+                sin.view(-1, self.qk_rope_head_dim),
+                rope_dim=self.qk_rope_head_dim,
+                is_neox_style=self.is_rope_neox_style,
+            )
+
+        nope_dim = self.head_dim - self.qk_rope_head_dim
+        if self.indexer_rope_at_end:
+            value_nope, value_pe = torch.split(value, [nope_dim, self.qk_rope_head_dim], dim=-1)
+        else:
+            value_pe, value_nope = torch.split(value, [self.qk_rope_head_dim, nope_dim], dim=-1)
+        cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
+        sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
+        value_pe = torch_npu.npu_rotary_mul(value_pe.unsqueeze(2), cos, sin).squeeze(2)
+        parts = (value_nope, value_pe) if self.indexer_rope_at_end else (value_pe, value_nope)
+        return torch.cat(parts, dim=-1)
+
     def indexer_select_pre_process(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
+        assert self.wk_weights_proj is not None and self.k_norm is not None
         kw, _ = self.wk_weights_proj(x)
         k_li = kw[:, : self.head_dim]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
-
-        if HAS_TRITON:
-            cos = cos.view(-1, self.qk_rope_head_dim)
-            sin = sin.view(-1, self.qk_rope_head_dim)
-            k_li = rope_forward_triton_siso(
-                k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
-        else:
-            k_li_pe, k_li_nope = torch.split(
-                k_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )
-
-            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
-            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-
-            k_li_pe = k_li_pe.unsqueeze(2)
-            k_li_pe = torch_npu.npu_rotary_mul(k_li_pe, cos, sin)
-            k_li_pe = k_li_pe.squeeze(2)
-
-            k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
+        k_li = self._apply_indexer_rope(k_li, cos, sin)
 
         if self.use_sparse_c8_indexer:
             k_li = k_li @ AscendSFAImpl.k_hadamard
@@ -961,23 +986,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
+        assert self.wk_weights_proj is not None and self.wq_b is not None
         kw, _ = self.wk_weights_proj(x)
         weights = kw[:, self.head_dim :]
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
         q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
-        if HAS_TRITON:
-            q_li = rope_forward_triton_siso(
-                q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
-        else:
-            q_li_pe, q_li_nope = torch.split(
-                q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )  # [b,s,64,64+64]
-
-            q_li_pe = q_li_pe.unsqueeze(2)
-            q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
-            q_li_pe = q_li_pe.squeeze(2)
-            q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
+        q_li = self._apply_indexer_rope(q_li, cos, sin)
 
         if self.use_sparse_c8_indexer:
             q_li_shape_ori = q_li.shape
@@ -1004,7 +1018,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 key_quant_mode=0,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.topk_tokens,
                 sparse_mode=3,
             )
         elif self.use_torch_npu_lightning_indexer:
@@ -1017,7 +1031,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=attn_metadata.block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.topk_tokens,
                 sparse_mode=3,
             )
         else:
@@ -1030,7 +1044,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 block_table=attn_metadata.block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=self.topk_tokens,
                 sparse_mode=3,
             )
         return topk_indices
@@ -1044,12 +1058,16 @@ class AscendSFAImpl(MLAAttentionImpl):
         return topk_indices
 
     def _update_indexcache_topk_indices(self, topk_indices: torch.Tensor) -> None:
-        if self.topk_indices_buffer is None:
+        self._copy_topk_indices(self.topk_indices_buffer, topk_indices)
+
+    @staticmethod
+    def _copy_topk_indices(buffer: torch.Tensor | None, topk_indices: torch.Tensor) -> None:
+        if buffer is None:
             return
         num_tokens = topk_indices.shape[0]
         topk_tokens = topk_indices.shape[-1]
         topk_indices_to_cache = topk_indices
-        topk_indices_buffer = self.topk_indices_buffer[:num_tokens, :topk_tokens]
+        topk_indices_buffer = buffer[:num_tokens, :topk_tokens]
         if topk_indices_to_cache.dim() == 3 and topk_indices_buffer.dim() == 2:
             assert topk_indices_to_cache.shape[1] == 1
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
@@ -1123,6 +1141,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         }
+        k_li = None
+        k_li_scale = None
+        kv_ag_handle = None
+        fused_kv_no_split = None
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
@@ -1158,7 +1180,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
             q_c = self.q_a_layernorm(q_c)
 
-            k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
+            if not self.skip_topk:
+                k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
 
             wait_for_kv_layer_from_connector(layer_name)
 
@@ -1171,19 +1194,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.enable_dsa_cp:
                 assert k_pe is not None
                 assert k_nope is not None
-                assert k_li is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
                 # support all_gather kv async for communication calculation overlap
                 if not self.use_sparse_c8_indexer:
+                    kv_parts = [
+                        k_pe.view(-1, k_pe.shape[-1]),
+                        k_nope.view(-1, k_nope.shape[-1]),
+                    ]
+                    if k_li is not None:
+                        kv_parts.append(k_li.view(-1, k_li.shape[-1]))
                     fused_kv_no_split, kv_ag_handle = all_gather_async(
-                        torch.cat(
-                            [
-                                k_pe.view(-1, k_pe.shape[-1]),
-                                k_nope.view(-1, k_nope.shape[-1]),
-                                k_li.view(-1, k_li.shape[-1]),
-                            ],
-                            dim=1,
-                        ),
+                        torch.cat(kv_parts, dim=1),
                         get_tp_group(),
                         async_op=async_op,
                     )
@@ -1230,7 +1251,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
                 if kv_cache is not None:
                     assert fused_kv_no_split is not None
-                    if not self.use_sparse_c8_indexer:
+                    if not self.use_sparse_c8_indexer and k_li is not None:
                         k_pe, k_nope, k_li = fused_kv_no_split.split(
                             [self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim], dim=-1
                         )
@@ -1246,9 +1267,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                         slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
                     )
 
-            k_li = self._get_full_kv(k_li, attn_metadata)
+            if k_li is not None:
+                k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if kv_cache is not None:
+        if kv_cache is not None and k_li is not None and len(kv_cache) > 2:
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
             torch_npu.npu_scatter_nd_update_(
@@ -1281,12 +1303,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
+        self._copy_topk_indices(self.topk_capture_buffer, topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )
 
         attn_output = self._v_up_proj(attn_output)
+        attn_output = self._apply_output_gate(hidden_states, attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
             inputs=self.o_proj.weight,

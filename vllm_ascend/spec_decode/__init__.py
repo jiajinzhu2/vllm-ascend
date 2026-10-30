@@ -24,6 +24,7 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
+from vllm_ascend.spec_decode.hy_dflash_proposer import AscendHYDflashProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
@@ -42,6 +43,10 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method in ("eagle", "eagle3", "mtp"):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
+        draft_config = vllm_config.speculative_config.draft_model_config.hf_config
+        dflash_config = getattr(draft_config, "dflash_config", {}) or {}
+        if dflash_config.get("ascend_proposer") == "hy":
+            return AscendHYDflashProposer(vllm_config, device, runner)
         return AscendDflashProposer(vllm_config, device, runner)
     elif method == "draft_model":
         return AscendDraftModelProposer(vllm_config, device, runner)
