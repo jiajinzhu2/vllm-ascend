@@ -16,6 +16,8 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.hy_dflash import (
+    HYTargetLayerState,
+    HYTargetState,
     gather_context,
     select_context_indices,
 )
@@ -126,16 +128,74 @@ class AscendHYDflashProposer(AscendDflashProposer):
         self.target_kv_cache_group_ids = tuple(layer_groups[name] for name in self.attn_layer_names)
         self.kv_cache_gid = self.target_kv_cache_group_ids[0]
 
-    def prepare_context(self, anchor_positions: torch.Tensor) -> None:
-        """Fetch per-layer anchor-1 indexer rows and gather target KV read-only."""
+    def _target_state_from_main_model(
+        self,
+        anchor_positions: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+    ) -> HYTargetState:
+        """Expose the public main model's live SFA pages to the draft."""
+        batch = anchor_positions.shape[0]
+        rows = token_indices_to_sample[:batch].long()
+        layers = []
+        for layer_id, group_id in zip(self.target_layer_ids, self.target_kv_cache_group_ids, strict=True):
+            attention = self._target_model.get_hy_dflash_attention(layer_id)
+            pages = attention.mla_attn.mla_attn.kv_cache
+            layers.append(
+                HYTargetLayerState(
+                    layer_id=layer_id,
+                    cache=pages[0],
+                    rope_cache=pages[1],
+                    block_table=self.runner.input_batch.block_table[group_id].get_device_tensor()[:batch],
+                    topk_indices=self._target_model.get_hy_dflash_topk_buffer(layer_id)[rows],
+                )
+            )
+
+        anchor_query_positions = target_positions[..., rows].long() + 1
+        offsets = torch.arange(self.query_block_size, dtype=torch.int64, device=self.device)
+        if anchor_query_positions.ndim == 1:
+            query_positions = anchor_query_positions[:, None] + offsets
+            query_positions = query_positions.unsqueeze(0).expand(3, -1, -1)
+        else:
+            query_positions = anchor_query_positions[..., None] + offsets
+
+        document_starts = getattr(self.runner.input_batch, "document_starts", None)
+        if document_starts is None:
+            document_starts = torch.zeros_like(anchor_positions)
+        else:
+            document_starts = document_starts[:batch].to(device=self.device, dtype=anchor_positions.dtype)
+        return HYTargetState(
+            layers=tuple(layers),
+            document_starts=document_starts,
+            final_hidden=target_hidden_states[rows],
+            query_positions=query_positions,
+        )
+
+    def prepare_context(
+        self,
+        anchor_positions: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+    ) -> None:
+        """Gather each target layer's anchor-1 selection without KV writes."""
         batch = anchor_positions.shape[0]
         request_ids = tuple(self.runner.input_batch.req_ids[:batch])
-        state = self._target_model.get_hy_dflash_context(
-            request_ids=request_ids,
-            anchor_positions=anchor_positions,
-            layer_ids=self.target_layer_ids,
-            block_size=self.query_block_size,
-        )
+        if hasattr(self._target_model, "get_hy_dflash_attention"):
+            state = self._target_state_from_main_model(
+                anchor_positions,
+                target_positions,
+                target_hidden_states,
+                token_indices_to_sample,
+            )
+        else:
+            state = self._target_model.get_hy_dflash_context(
+                request_ids=request_ids,
+                anchor_positions=anchor_positions,
+                layer_ids=self.target_layer_ids,
+                block_size=self.query_block_size,
+            )
         if tuple(layer.layer_id for layer in state.layers) != self.target_layer_ids:
             raise ValueError("Target context is not in the configured draft layer order")
         contexts = []
@@ -180,7 +240,14 @@ class AscendHYDflashProposer(AscendDflashProposer):
         num_tokens = batch * self.query_block_size
         self.input_ids[:num_tokens].fill_(self.parallel_drafting_token_id)
         self.input_ids[: num_tokens : self.query_block_size].copy_(next_token_ids.reshape(batch))
-        self.prepare_context(accepted_lengths)
+        if token_indices_to_sample is None:
+            token_indices_to_sample = cad.query_start_loc[1:] - 1
+        self.prepare_context(
+            accepted_lengths,
+            target_positions,
+            target_hidden_states,
+            token_indices_to_sample,
+        )
         indices = torch.arange(num_tokens, device=self.device, dtype=torch.int32).view(batch, self.query_block_size)[
             :, 1:
         ]

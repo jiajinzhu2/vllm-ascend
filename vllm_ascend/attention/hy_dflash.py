@@ -28,6 +28,9 @@ class HYTargetLayerState:
     cache: torch.Tensor
     block_table: torch.Tensor
     topk_indices: torch.Tensor
+    # Ascend SFA stores latent KV and rotated RoPE keys in separate pages.
+    # When omitted, ``cache`` is the legacy concatenated [latent, rope] view.
+    rope_cache: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,13 @@ def gather_context(layer: HYTargetLayerState, indices: torch.Tensor) -> HYContex
         raise ValueError("HY context points to an unallocated target KV block")
     slots = physical_blocks.clamp(0, cache.shape[0] - 1) * block_size + indices.clamp_min(0) % block_size
     kv = cache.flatten(0, 1)[slots]
+    if kv.ndim == 4 and kv.shape[-2] == 1:
+        kv = kv.squeeze(-2)
+    if layer.rope_cache is not None:
+        rope = layer.rope_cache.flatten(0, 1)[slots]
+        if rope.ndim == 4 and rope.shape[-2] == 1:
+            rope = rope.squeeze(-2)
+        kv = torch.cat((kv, rope), dim=-1)
     kv = kv.masked_fill(~addressable[..., None], 0)
     return HYContext(layer.layer_id, indices, kv, addressable)
 
@@ -154,13 +164,31 @@ class HYDflashAttention(nn.Module):
         value_up: torch.Tensor,
         rope_dim: int,
         scale: float,
+        source_attention: nn.Module | None = None,
     ):
         super().__init__()
+        if source_attention is not None:
+            self.source_attention = source_attention
         self.project, self.rotary, self.finish = project, rotary, finish
         # These are views of already-loaded weights, not new trained parameters.
         self.register_buffer("key_up", key_up, persistent=False)
         self.register_buffer("value_up", value_up, persistent=False)
         self.rope_dim, self.scale = rope_dim, scale
+
+    @classmethod
+    def from_hyv4(cls, attention: nn.Module) -> "HYDflashAttention":
+        """Reuse a loaded public main-model attention implementation."""
+        key_up, value_up = attention.draft_kv_up_weights()
+        return cls(
+            attention.draft_project,
+            attention.draft_rotary,
+            attention.draft_finish,
+            key_up,
+            value_up,
+            attention.qk_rope_head_dim,
+            attention.scaling,
+            source_attention=attention,
+        )
 
     def forward(self, hidden: torch.Tensor, positions: torch.Tensor, context: HYContext) -> torch.Tensor:
         q_nope, q_rope, latent, k_rope = self.project(hidden)

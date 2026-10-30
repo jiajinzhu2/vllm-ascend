@@ -431,6 +431,64 @@ def test_deferred_linear_bias(harness):
     torch.testing.assert_close(harness.adapter.linear_output(Deferred(), value), value * 2 + 1)
 
 
+def test_public_decoder_layer_reuse_keeps_loaded_modules(harness):
+    class PublicAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.project = TinyProject()
+            self.rotary = TinyRotary()
+            self.finish = TinyFinish()
+            self.key_up = nn.Parameter(torch.randn(2, 2, 3))
+            self.value_up = nn.Parameter(torch.randn(2, 2, 3))
+            self.qk_rope_head_dim = 6
+            self.scaling = 8**-0.5
+
+        def draft_project(self, hidden):
+            return self.project(hidden)
+
+        def draft_rotary(self, positions, query, key):
+            return self.rotary(positions, query, key)
+
+        def draft_finish(self, hidden, output):
+            return self.finish(hidden, output)
+
+        def draft_kv_up_weights(self):
+            return self.key_up, self.value_up
+
+    public = SimpleNamespace(
+        input_layernorm=nn.RMSNorm(4),
+        self_attn=PublicAttention(),
+        post_attention_layernorm=nn.RMSNorm(4),
+        mlp=TinyMLP(),
+    )
+    adapted = harness.adapter.HYDenseDraftLayer.from_hyv4_layer(public)
+    assert adapted.input_norm is public.input_layernorm
+    assert adapted.post_attention_norm is public.post_attention_layernorm
+    assert adapted.mlp is public.mlp
+    assert adapted.attention.source_attention is public.self_attn
+    assert adapted.attention.key_up.data_ptr() == public.self_attn.key_up.data_ptr()
+    assert adapted.attention.value_up.data_ptr() == public.self_attn.value_up.data_ptr()
+
+
+def test_public_indexer_schedule_keeps_draft_source_layers_full(harness):
+    path = harness.root / "vllm_ascend/models/hy_v4.py"
+    tree = ast.parse(path.read_text())
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "compute_skip_topk_layers"
+    )
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
+        type_ignores=[],
+    )
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    indexer_types = ["full", "full"] + ["shared", "shared", "shared", "full"] * 19
+    config = SimpleNamespace(num_hidden_layers=78, indexer_types=indexer_types)
+    skipped = namespace["compute_skip_topk_layers"](config)
+    assert {2, 3, 4, 6, 7, 8}.issubset(skipped)
+    assert not skipped.intersection({61, 65, 69, 73, 77})
+
+
 def test_fusion_only_slot_zero_and_five_distinct_contexts(harness):
     p = make_proposer(harness)
     seen = []
@@ -498,6 +556,47 @@ def test_first_pass_rejections_logical_positions_and_read_only_cache(harness):
     assert not hasattr(p, "_context_slot_mapping_buffer")
     assert not p.eagle3_use_aux_hidden_state
     assert isinstance(p, harness.parent)
+
+
+def test_main_model_live_kv_bridge_uses_sample_rows_and_layer_groups(harness):
+    p = make_proposer(harness)
+    layer_ids = p.target_layer_ids
+
+    class BlockTable:
+        def __init__(self, value):
+            self.value = value
+
+        def get_device_tensor(self):
+            return self.value
+
+    class MainTarget:
+        def __init__(self):
+            self.attentions = {}
+            self.topk = {}
+            for layer_id in layer_ids:
+                pages = [torch.randn(8, 4, 1, 3), torch.randn(8, 4, 1, 6)]
+                self.attentions[layer_id] = SimpleNamespace(
+                    mla_attn=SimpleNamespace(mla_attn=SimpleNamespace(kv_cache=pages))
+                )
+                self.topk[layer_id] = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
+
+        def get_hy_dflash_attention(self, layer_id):
+            return self.attentions[layer_id]
+
+        def get_hy_dflash_topk_buffer(self, layer_id):
+            return self.topk[layer_id]
+
+    p._target_model = MainTarget()
+    p.target_kv_cache_group_ids = tuple(range(len(layer_ids)))
+    page_table = torch.stack((torch.arange(4), torch.arange(4, 8)))
+    p.runner.input_batch.block_table = {idx: BlockTable(page_table) for idx in range(len(layer_ids))}
+    hidden = torch.arange(8).view(2, 4).float()
+    positions = torch.tensor([[4, 8], [14, 18], [24, 28]])
+    p.set_inputs_first_pass(None, torch.tensor([3, 4]), positions, hidden, None, metadata(), None)
+    torch.testing.assert_close(p._target_final_hidden, hidden)
+    assert p._contexts[0].kv.shape[-1] == 9
+    assert p.mrope_positions[:, 0].tolist() == [5, 15, 25]
+    assert p.mrope_positions[:, 8].tolist() == [9, 19, 29]
 
 
 def test_request_reordering_changes_context_binding(harness):

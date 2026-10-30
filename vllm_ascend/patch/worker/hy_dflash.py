@@ -63,6 +63,16 @@ class HYDenseDraftLayer(nn.Module):
         self.input_norm, self.attention = input_norm, attention
         self.post_attention_norm, self.mlp = post_attention_norm, mlp
 
+    @classmethod
+    def from_hyv4_layer(cls, layer: nn.Module) -> "HYDenseDraftLayer":
+        """Adapt a loaded draft layer built with the public main-model classes."""
+        return cls(
+            layer.input_layernorm,
+            HYDflashAttention.from_hyv4(layer.self_attn),
+            layer.post_attention_layernorm,
+            layer.mlp,
+        )
+
     def forward(self, hidden: torch.Tensor, positions: torch.Tensor, context: HYContext) -> torch.Tensor:
         shape = hidden.shape
         normalized = self.input_norm(hidden.flatten(0, 1)).view(shape)
@@ -82,6 +92,22 @@ class HYDflashAdapter(nn.Module):
     """
 
     hy_dflash_contract_version = 2
+
+    @classmethod
+    def from_hyv4_backbone(
+        cls,
+        backbone_layers: Sequence[nn.Module],
+        **kwargs,
+    ) -> "HYDflashAdapter":
+        """Compose the draft around loaded public decoder-layer modules.
+
+        Checkpoint-specific fusion/correction/confidence modules stay explicit
+        in ``kwargs``; only the standard MLA/MLP backbone is adapted here.
+        """
+        return cls(
+            layers=[HYDenseDraftLayer.from_hyv4_layer(layer) for layer in backbone_layers],
+            **kwargs,
+        )
 
     def __init__(
         self,
