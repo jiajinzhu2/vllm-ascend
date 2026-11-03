@@ -138,6 +138,7 @@ class HY4DflyModels(nn.Module):
         fusion = self.model.fusion
         return HYDflashAdapter.from_hyv4_backbone(
             self.model.layers,
+            attention_backend=options["ascend_attention_backend"],
             embed_tokens=self.model.embed_tokens,
             final_norm=self.model.norm,
             fusion=HYMTPFusion(fusion.embedding_norm, fusion.hidden_norm, fusion.eh_proj, fusion.gate),

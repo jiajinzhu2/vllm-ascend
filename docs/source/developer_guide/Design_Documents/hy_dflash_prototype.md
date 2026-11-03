@@ -144,10 +144,51 @@ eager execution, with floating-point target KV, PP/DP/PCP/DCP equal to one,
 no LoRA and no separate LM-head TP. Multimodal target ingestion is outside this
 text-serving adapter's validation.
 
-The target's learned sink uses a chunked PyTorch reference fallback because
-0.20.2 SFA exposes neither a sink argument nor LSE. Target sink attention and
-draft dual-source attention need native kernels for production performance.
-No throughput or acceptance-rate claim is made.
+The target's learned sink still uses a chunked PyTorch reference fallback:
+this change replaces the **draft** attention, not the target backend. No
+throughput or acceptance-rate claim is made.
+
+## A5 draft Sparse Flash Attention
+
+`dflash_config.ascend_attention_backend` accepts `auto` (default), `sfa` or
+`reference`. Add the field to the existing draft checkpoint configuration;
+preserve its other fields. `auto` selects native SFA on A5 and the reference
+path on other devices. `sfa` requires A5. Startup logs the selected backend
+for each draft layer. `reference` is the explicit FP32-attention comparison.
+
+The native path requires BF16 projections/context, `kv_lora_rank=512`,
+`qk_rope_head_dim=64`, and 1 through 128 query heads per TP rank. It calls
+`torch.ops.npu.npu_sparse_flash_attention`, not the old `_C_ascend` binding.
+For a checkpoint with a learned attention sink, the installed operator schema
+must include `sinks`, dispatching `aclnnSparseFlashAttentionV2`. A5 / CANN 9.2.0
+is the intended environment; a `torch_npu` version string alone does not
+guarantee that its build exposes the new argument. Check the serving host:
+
+```bash
+python -c 'import torch, torch_npu; print(torch.ops.npu.npu_sparse_flash_attention.default._schema)'
+```
+
+Missing schema features or incompatible dimensions fail explicitly; the native
+path never ignores a sink or catches a kernel failure to silently run Python
+attention. CANN must also provide the corresponding A5 kernel. Check the
+[official SFA constraints](https://github.com/Ascend/op-plugin/blob/35742aa0e083ec06cd9ef317d17f2eca95fa4e7d/docs/zh/custom_APIs/torch_npu/torch_npu-npu_sparse_flash_attention.md)
+against the installed package.
+
+Selected target latent KV and already-rotated RoPE keys are gathered as before.
+Each layer concatenates these with its transient current-block KV into a
+fixed-shape BSND buffer. Int32 sparse indices select valid context and block
+positions `0..query_position`, with invalid indices packed at the end. SFA uses
+`attention_mode=2`, `sparse_block_size=1`, and `sparse_mode=0`: causality is
+already encoded in the indices, including holes/empty contexts and padded
+requests. Mode 0 does not bypass sparse selection. The target cache remains
+read-only, and gathered slots are never used as new RoPE coordinates.
+
+Query absorption and output up-projection use BF16 matmuls around the fused
+QK/softmax/PV operation. The original model scale is preserved. K and V alias
+the same latent buffer; this avoids requiring the newer `value=None` schema.
+Sinks use FP32, and LSE output is disabled. BF16 rounding differs from the
+FP32 reference, so per-layer accuracy and real checkpoint proposals must be
+validated before drawing acceptance-rate or performance conclusions.
 
 ## Draft FULL graphs in model_runner_v1
 
@@ -161,8 +202,11 @@ The worker calls the v1 runner's draft capture path even though the target's
 graph dispatcher is disabled. The proposer uses `ACLGraphWrapper` with FULL
 graphs covering slot-0 fusion, all five layers, the seven LM-head projections
 and argmax. Context top-k selection, page gathering, validation and buffer
-copies remain outside the graph. There are no FIA task handles or draft paged
-KV writes in this reference attention implementation.
+copies remain outside the graph. SFA index construction and the fused operation
+are captured with the draft. Fixed BSND shapes and device sparse-index values
+avoid CPU sequence-length updates and FIA task handles. No draft paged KV is
+written. Real CANN capture/replay support is covered by the hardware smoke test
+below and has not been verified in the CPU development environment.
 
 Capture buckets count **requests**, not target padded tokens: powers of two up
 to `max_num_seqs`, plus `max_num_seqs` itself, captured largest first. For example,
@@ -200,8 +244,19 @@ distributed or real-checkpoint compatibility.
 
 On the NPU environment, compare greedy outputs with and without speculation:
 
+First run the standalone A5 test with the actual per-rank head count. It needs
+no private weights and checks sink/no-sink accuracy, full/holed/empty contexts,
+causal future-token isolation, changing fixed-address inputs, actual NPUGraph
+replay and warmed graph timing:
+
 ```bash
-python tests/e2e/multicard/test_hy_dflash.py --target /models/HY4-mxfp8 --draft /models/HY4-draft-bf16 --tp 8
+python tests/e2e/singlecard/test_hy_dflash_sfa.py --heads 16
+```
+
+Then run the checkpoint/distributed check, requiring native SFA on every rank:
+
+```bash
+python tests/e2e/multicard/test_hy_dflash.py --target /models/HY4-mxfp8 --draft /models/HY4-draft-bf16 --tp 8 --require-sfa
 ```
 
 The script runs baseline, eager padded/compacted and graph padded/compacted

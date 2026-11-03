@@ -60,11 +60,11 @@ class HYDenseDraftLayer(nn.Module):
         self.post_attention_norm, self.mlp = post_attention_norm, mlp
 
     @classmethod
-    def from_hyv4_layer(cls, layer: nn.Module) -> "HYDenseDraftLayer":
+    def from_hyv4_layer(cls, layer: nn.Module, *, attention_backend: str = "auto") -> "HYDenseDraftLayer":
         """Adapt a loaded draft layer built with the public main-model classes."""
         return cls(
             layer.input_layernorm,
-            HYDflashAttention.from_hyv4(layer.self_attn),
+            HYDflashAttention.from_hyv4(layer.self_attn, attention_backend=attention_backend),
             layer.post_attention_layernorm,
             layer.mlp,
         )
@@ -93,6 +93,7 @@ class HYDflashAdapter(nn.Module):
     def from_hyv4_backbone(
         cls,
         backbone_layers: Sequence[nn.Module],
+        attention_backend: str = "auto",
         **kwargs,
     ) -> "HYDflashAdapter":
         """Compose the draft around loaded public decoder-layer modules.
@@ -101,7 +102,10 @@ class HYDflashAdapter(nn.Module):
         in ``kwargs``; only the standard MLA/MLP backbone is adapted here.
         """
         return cls(
-            layers=[HYDenseDraftLayer.from_hyv4_layer(layer) for layer in backbone_layers],
+            layers=[
+                HYDenseDraftLayer.from_hyv4_layer(layer, attention_backend=attention_backend)
+                for layer in backbone_layers
+            ],
             **kwargs,
         )
 

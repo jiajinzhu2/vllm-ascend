@@ -165,6 +165,9 @@ class AscendHYDflashProposer(AscendDflashProposer):
         if not isinstance(draft, HYDflashAdapter):
             draft = draft.to_hy_dflash_adapter(model)
         self.model = draft
+        logger.info(
+            "HY DFlash draft attention backends: %s", [layer.attention.attention_backend for layer in draft.layers]
+        )
         self.attn_layer_names = list(model.get_hy_dflash_layer_names(self.target_layer_ids))
         if (
             draft.hidden_size != self.hidden_size

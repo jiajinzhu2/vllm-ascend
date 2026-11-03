@@ -187,6 +187,142 @@ def config(k=7):
     )
 
 
+@pytest.mark.parametrize("query_len", [1, 8])
+@pytest.mark.parametrize("capacity", [0, 1, 13, 2056])
+def test_sfa_indices_exact_context_and_causal_block(harness, query_len, capacity):
+    valid = torch.arange(capacity).expand(3, -1) % 3 == 0
+    valid = valid.clone()
+    valid[1] = False
+    valid[2] = True
+    indices = harness.attention.hy_sfa_indices(valid, query_len)
+    assert indices.shape == (3, query_len, 1, capacity + query_len)
+    assert indices.dtype == torch.int32 and indices.is_contiguous()
+    for batch in range(3):
+        for query in range(query_len):
+            wanted = torch.cat((torch.where(valid[batch])[0], torch.arange(capacity, capacity + query + 1)))
+            actual = indices[batch, query, 0]
+            torch.testing.assert_close(actual[: len(wanted)].long(), wanted)
+            assert (actual[len(wanted) :] == -1).all()
+
+
+def emulate_native_sfa(query, key, value, indices, scale, **kwargs):
+    """CPU semantic oracle for the operator contract, not an NPU emulator."""
+    assert key.data_ptr() == value.data_ptr()
+    assert kwargs["attention_mode"] == 2 and kwargs["sparse_mode"] == 0
+    assert kwargs["sparse_block_size"] == 1 and not kwargs["return_softmax_lse"]
+    assert kwargs["layout_query"] == kwargs["layout_kv"] == "BSND"
+    assert query.is_contiguous() and key.is_contiguous() and indices.is_contiguous()
+    assert kwargs["key_rope"].is_contiguous() and kwargs["query_rope"].is_contiguous()
+    output = torch.empty_like(query)
+    for b in range(query.shape[0]):
+        for q in range(query.shape[1]):
+            row = indices[b, q, 0]
+            slots = row[row >= 0].long()
+            assert slots.unique().numel() == slots.numel()
+            scores = query[b, q].float() @ key[b, slots, 0].float().T
+            scores += kwargs["query_rope"][b, q].float() @ kwargs["key_rope"][b, slots, 0].float().T
+            scores *= scale
+            values = value[b, slots, 0].float()
+            if "sinks" in kwargs:
+                assert kwargs["sinks"].dtype == torch.float32
+                scores = torch.cat((scores, kwargs["sinks"][:, None]), dim=-1)
+                values = torch.cat((values, torch.zeros_like(values[:1])))
+            output[b, q] = scores.softmax(-1) @ values
+    return output, torch.empty(0), torch.empty(0)
+
+
+@pytest.mark.parametrize("sink", [False, True])
+def test_sfa_attention_matches_reference_and_refreshes_indices(harness, sink):
+    torch.manual_seed(27)
+    a = harness.attention
+    batch, queries, heads, nope, rank, rope = 3, 8, 3, 16, 512, 64
+    capacity = 11
+
+    def bf16(*shape):
+        return torch.randn(*shape).bfloat16()
+
+    q = bf16(batch, queries, heads, nope)
+    qr = bf16(batch, queries, heads, rope)
+    latent, kr = bf16(batch, queries, rank), bf16(batch, queries, rope)
+    key_up = (torch.randn(heads, nope, rank) / rank**0.5).bfloat16()
+    value_up = (torch.randn(heads, 12, rank) / rank**0.5).bfloat16()
+    valid = torch.arange(capacity).expand(batch, -1).clone() % 3 != 1
+    valid[1] = False
+    kv = bf16(batch, capacity, rank + rope)
+    context = a.HYContext(61, torch.arange(capacity).expand(batch, -1), kv, valid)
+    sinks = torch.tensor([-3, 0, 4], dtype=torch.bfloat16) if sink else None
+    scale = (nope + rope) ** -0.5
+
+    def run():
+        return a.sfa_absorbed_mla(q, qr, latent, kr, context, key_up, value_up, scale, sinks, sfa_op=emulate_native_sfa)
+
+    for _ in range(2):
+        expected = a.absorbed_mla(q, qr, latent, kr, context, key_up, value_up, scale, sinks)
+        actual = run()
+        torch.testing.assert_close(actual.float(), expected.float(), atol=0.02, rtol=0.03)
+        before = actual[:, 0].clone()
+        saved_latent, saved_rope, saved_kv = latent.clone(), kr.clone(), kv.clone()
+        # Future draft K/V and invalid context must not affect query zero.
+        latent[:, 1:] += 10
+        kr[:, 1:] -= 10
+        kv[~valid] += 20
+        torch.testing.assert_close(run()[:, 0], before, atol=0, rtol=0)
+        latent.copy_(saved_latent)
+        kr.copy_(saved_rope)
+        kv.copy_(saved_kv)
+        # Update the captured inputs in place: holes, empty/full context, order.
+        valid.copy_(~valid.roll(1, dims=0))
+        kv.copy_(kv.roll(1, dims=0))
+
+
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_sfa_operator_requires_sink_capability(harness, monkeypatch, has_sink):
+    op = SimpleNamespace(
+        _schema=SimpleNamespace(arguments=[SimpleNamespace(name=n) for n in ("attention_mode", "return_softmax_lse")])
+    )
+    monkeypatch.setattr(torch.ops.npu, "npu_sparse_flash_attention", SimpleNamespace(default=op), raising=False)
+    if has_sink:
+        with pytest.raises(RuntimeError, match="sinks"):
+            harness.attention.get_hy_sfa_op(has_sink=True)
+    else:
+        assert harness.attention.get_hy_sfa_op(has_sink=False) is op
+    op._schema.arguments.append(SimpleNamespace(name="sinks"))
+    assert harness.attention.get_hy_sfa_op(has_sink=True) is op
+
+
+def test_sfa_backend_config_is_explicit_and_validated(harness):
+    cfg = config().speculative_config.draft_model_config.hf_config
+    assert harness.config_module.get_hy_dflash_config(cfg)["ascend_attention_backend"] == "auto"
+    for backend in ("sfa", "reference"):
+        cfg.dflash_config["ascend_attention_backend"] = backend
+        assert harness.config_module.get_hy_dflash_config(cfg)["ascend_attention_backend"] == backend
+    cfg.dflash_config["ascend_attention_backend"] = "unknown"
+    with pytest.raises(ValueError, match="ascend_attention_backend"):
+        harness.config_module.get_hy_dflash_config(cfg)
+
+
+def test_sfa_rejects_incompatible_dtype_before_kernel(harness):
+    q = torch.zeros(1, 8, 1, 16)
+    context = harness.attention.HYContext(
+        61, torch.zeros(1, 4), torch.zeros(1, 4, 576), torch.ones(1, 4, dtype=torch.bool)
+    )
+    op = Mock()
+    with pytest.raises(ValueError, match="BF16"):
+        harness.attention.sfa_absorbed_mla(
+            q,
+            torch.zeros(1, 8, 1, 64),
+            torch.zeros(1, 8, 512),
+            torch.zeros(1, 8, 64),
+            context,
+            torch.zeros(1, 16, 512),
+            torch.zeros(1, 12, 512),
+            0.2,
+            None,
+            sfa_op=op,
+        )
+    op.assert_not_called()
+
+
 class TinyProject(nn.Module):
     def __init__(self):
         super().__init__()

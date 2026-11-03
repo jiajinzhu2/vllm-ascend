@@ -54,6 +54,9 @@ def get_hy_dflash_config(config) -> dict:
     options.setdefault("target_kv_layers", layers)
     options.setdefault("target_index_layers", options["target_kv_layers"])
     options.setdefault("target_init_attn_layers", options["target_kv_layers"])
+    options.setdefault("ascend_attention_backend", "auto")
+    if options["ascend_attention_backend"] not in ("auto", "sfa", "reference"):
+        raise ValueError("HY ascend_attention_backend must be auto, sfa or reference")
     count = getattr(config, "num_hidden_layers", len(layers))
     for key in ("target_layer_ids", "target_kv_layers", "target_index_layers", "target_init_attn_layers"):
         values = options[key]

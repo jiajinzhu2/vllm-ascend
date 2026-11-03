@@ -48,12 +48,14 @@ def stop_draft_trace(worker):
 def draft_graph_stats(worker):
     drafter = worker.model_runner.drafter
     if drafter is None:
-        return dict(captured=0, replays=0, trace=[])
+        return dict(captured=0, replays=0, trace=[], attention_backends=[], correction=False)
     entries = getattr(drafter._runnable, "concrete_aclgraph_entries", {})
     return dict(
         captured=sum(entry.aclgraph is not None for entry in entries.values()),
         replays=drafter.graph_replay_count,
         trace=getattr(drafter, "_hy_validation_trace", []),
+        attention_backends=[layer.attention.attention_backend for layer in drafter.model.layers],
+        correction=drafter.model.correction is not None,
     )
 
 
@@ -101,6 +103,10 @@ def run_engine(args):
         outputs = llm.generate(inputs, params)
         token_ids.extend(list(result.outputs[0].token_ids) for result in outputs)
     stats = llm.collective_rpc(draft_graph_stats)
+    if args.worker != "baseline":
+        assert all(not item["correction"] for item in stats), "Unexpected correction/Markov head"
+        if args.require_sfa:
+            assert all(item["attention_backends"] == ["sfa"] * 5 for item in stats), stats
     if args.worker.startswith("graph-"):
         assert all(item["captured"] == 3 and item["replays"] > 0 for item in stats), stats
     else:
@@ -124,6 +130,9 @@ def main():
     parser.add_argument("--target", required=True)
     parser.add_argument("--draft", required=True)
     parser.add_argument("--tp", type=int, required=True)
+    parser.add_argument(
+        "--require-sfa", action="store_true", help="Fail unless all five draft layers use SFA on every TP rank"
+    )
     parser.add_argument(
         "--benchmark-repeats", type=int, default=0, help="Time additional generations with tracing disabled"
     )
@@ -154,6 +163,7 @@ def main():
                     mode,
                     "--output",
                     str(output),
+                    *(["--require-sfa"] if args.require_sfa else []),
                 ],
                 check=True,
             )

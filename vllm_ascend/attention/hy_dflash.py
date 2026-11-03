@@ -3,7 +3,7 @@
 
 """Read-only target KV selection and absorbed, dual-source MLA for HY DFlash.
 
-This is a PyTorch correctness path, not a tuned Ascend sparse-attention kernel.
+The A5 path uses native SFA; the PyTorch path remains a numerical reference.
 Logical document/token positions are deliberately separate from 3-D M-RoPE.
 """
 
@@ -11,6 +11,96 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+SFA_LATENT_DIM = 512
+SFA_ROPE_DIM = 64
+SFA_MAX_QUERY_HEADS = 128
+
+
+def get_hy_sfa_op(*, has_sink: bool):
+    """Resolve the torch_npu operator once, before warmup or graph capture.
+
+    The old _C_ascend binding has neither sinks nor attention_mode. Never drop
+    a checkpoint's sink or fall back after a native kernel/capture failure.
+    """
+    try:
+        op = torch.ops.npu.npu_sparse_flash_attention.default
+    except AttributeError as error:
+        raise RuntimeError("HY SFA requires torch_npu.npu_sparse_flash_attention; update torch_npu/CANN") from error
+    required = {"attention_mode", "return_softmax_lse"}
+    if has_sink:
+        required.add("sinks")
+    missing = required - {arg.name for arg in op._schema.arguments}
+    if missing:
+        raise RuntimeError(
+            f"HY SFA operator is missing {sorted(missing)}. Install a torch_npu/CANN build with "
+            "aclnnSparseFlashAttentionV2 for sinks, or explicitly select ascend_attention_backend=reference."
+        )
+    return op
+
+
+def hy_sfa_indices(context_valid: torch.Tensor, query_len: int) -> torch.Tensor:
+    """Pack valid sparse indices first, including only causal block positions.
+
+    K/V stays [context capacity, current block], even for holes/empty contexts.
+    Both halves of the scatter destination are unique: invalid slots cannot
+    overwrite a valid slot. All lengths are device tensors and shapes are fixed
+    for a captured request bucket; no CPU seqlens or task updates are needed.
+    """
+    batch, capacity = context_valid.shape
+    valid = torch.cat((context_valid, context_valid.new_ones((batch, query_len))), dim=1)
+    valid_rank = valid.to(torch.int64).cumsum(dim=1)
+    invalid_rank = (~valid).to(torch.int64).cumsum(dim=1)
+    count = valid_rank[:, -1:]
+    destination = torch.where(valid, valid_rank - 1, count + invalid_rank - 1)
+    positions = torch.arange(capacity + query_len, device=valid.device).expand(batch, -1)
+    packed = torch.empty_like(positions).scatter_(1, destination, positions)
+    # Valid context precedes all Q current-block keys in the packed list.
+    lengths = count - query_len + torch.arange(1, query_len + 1, device=valid.device)
+    allowed = positions[:, None, :] < lengths[:, :, None]
+    return packed[:, None, :].expand(-1, query_len, -1).masked_fill(~allowed, -1).to(torch.int32).unsqueeze(2)
+
+
+def sfa_absorbed_mla(
+    query_nope, query_rope, block_latent, block_rope, context, key_up, value_up, scale, sinks, *, sfa_op
+):
+    """BF16 absorbed MLA with one joint native softmax over context and block.
+
+    sparse_mode=0 is intentional: sparse_indices already contains the exact
+    per-query causal set. The compact buffer's slots are NOT original RoPE
+    positions. Keep the model's original scale after absorbing the K weights.
+    """
+    batch, query_len, heads, _ = query_nope.shape
+    if (
+        block_latent.shape[-1] != SFA_LATENT_DIM
+        or query_rope.shape[-1] != SFA_ROPE_DIM
+        or not 1 <= heads <= SFA_MAX_QUERY_HEADS
+    ):
+        raise ValueError("HY A5 SFA requires latent=512, RoPE=64 and 1..128 local query heads")
+    if any(
+        t.dtype != torch.bfloat16
+        for t in (query_nope, query_rope, block_latent, block_rope, context.kv, key_up, value_up)
+    ):
+        raise ValueError("HY SFA requires BF16 projections and dequantized BF16 target context")
+    # Native BF16 matmuls avoid repeatedly expanding weights/activations to FP32.
+    query = torch.einsum("bqhd,hdr->bqhr", query_nope, key_up).contiguous()
+    key = torch.cat((context.kv[..., :SFA_LATENT_DIM], block_latent), dim=1).unsqueeze(2).contiguous()
+    key_rope = torch.cat((context.kv[..., SFA_LATENT_DIM:], block_rope), dim=1).unsqueeze(2).contiguous()
+    kwargs = dict(
+        query_rope=query_rope.contiguous(),
+        key_rope=key_rope,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=0,
+        attention_mode=2,
+        return_softmax_lse=False,
+    )
+    if sinks is not None:
+        kwargs["sinks"] = sinks.float().contiguous()
+    # Tensor V aliases K, including on torch_npu builds predating value=None.
+    latent_output, _, _ = sfa_op(query, key, key, hy_sfa_indices(context.valid, query_len), scale, **kwargs)
+    return torch.einsum("bqhr,hvr->bqhv", latent_output, value_up)
 
 
 def apply_hy_rotary(rotary, positions, query, key, *, sections=None):
@@ -226,6 +316,7 @@ class HYDflashAttention(nn.Module):
         rope_dim: int,
         scale: float,
         source_attention: nn.Module | None = None,
+        attention_backend: str = "auto",
     ):
         super().__init__()
         if source_attention is not None:
@@ -235,9 +326,30 @@ class HYDflashAttention(nn.Module):
         self.register_buffer("key_up", key_up, persistent=False)
         self.register_buffer("value_up", value_up, persistent=False)
         self.rope_dim, self.scale = rope_dim, scale
+        if attention_backend not in ("auto", "sfa", "reference"):
+            raise ValueError("HY ascend_attention_backend must be auto, sfa or reference")
+        self.attention_backend = "reference"
+        self._sfa_op = None
+        if attention_backend != "reference" and key_up.device.type == "npu":
+            # Worker-only capability discovery; CPU reference tests do not load
+            # torch_npu or initialize any NPU runtime.
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            if get_ascend_device_type() == AscendDeviceType.A5:
+                if (
+                    key_up.shape[-1] != SFA_LATENT_DIM
+                    or rope_dim != SFA_ROPE_DIM
+                    or not 1 <= key_up.shape[0] <= SFA_MAX_QUERY_HEADS
+                ):
+                    raise ValueError("HY A5 SFA requires latent=512, RoPE=64 and 1..128 local query heads")
+                sinks = getattr(source_attention, "learnable_sink_param", None)
+                self._sfa_op = get_hy_sfa_op(has_sink=sinks is not None)
+                self.attention_backend = "sfa"
+        if attention_backend == "sfa" and self._sfa_op is None:
+            raise ValueError("HY SFA backend requires an Ascend A5 NPU")
 
     @classmethod
-    def from_hyv4(cls, attention: nn.Module) -> "HYDflashAttention":
+    def from_hyv4(cls, attention: nn.Module, *, attention_backend: str = "auto") -> "HYDflashAttention":
         """Reuse a loaded public main-model attention implementation."""
         key_up, value_up = attention.draft_kv_up_weights()
         return cls(
@@ -249,11 +361,28 @@ class HYDflashAttention(nn.Module):
             attention.qk_rope_head_dim,
             attention.scaling,
             source_attention=attention,
+            attention_backend=attention_backend,
         )
 
     def forward(self, hidden: torch.Tensor, positions: torch.Tensor, context: HYContext) -> torch.Tensor:
         q_nope, q_rope, latent, k_rope = self.project(hidden)
         q_rope, k_rope = self.rotary(positions, q_rope, k_rope)
         sinks = getattr(getattr(self, "source_attention", None), "learnable_sink_param", None)
-        output = absorbed_mla(q_nope, q_rope, latent, k_rope, context, self.key_up, self.value_up, self.scale, sinks)
+        if self._sfa_op is None:
+            output = absorbed_mla(
+                q_nope, q_rope, latent, k_rope, context, self.key_up, self.value_up, self.scale, sinks
+            )
+        else:
+            output = sfa_absorbed_mla(
+                q_nope,
+                q_rope,
+                latent,
+                k_rope,
+                context,
+                self.key_up,
+                self.value_up,
+                self.scale,
+                sinks,
+                sfa_op=self._sfa_op,
+            )
         return self.finish(hidden, output)
