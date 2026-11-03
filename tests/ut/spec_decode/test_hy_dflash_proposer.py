@@ -18,7 +18,7 @@ import struct
 import sys
 import typing
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -34,10 +34,52 @@ class GraphMode(Enum):
     FULL = 1
 
 
+@dataclass(frozen=True)
+class BatchDescriptor:
+    num_tokens: int
+    num_reqs: int
+    uniform: bool
+
+
 @pytest.fixture
 def harness(monkeypatch):
     root = Path(__file__).resolve().parents[3]
     events = []
+    capture_events = []
+
+    class AddressGraph:
+        """CPU stand-in that reuses capture-time tensor views on every replay.
+
+        It deliberately never calls the proposer's Python runnable on replay.
+        This tests buffer lifetimes/data updates, not NPU graph operator support.
+        """
+
+        def __init__(self, runnable, config, **kwargs):
+            self.proposer = runnable.__self__
+            self.runnable = runnable
+            self.concrete_aclgraph_entries = {}
+            self.captured_batches = []
+
+        def __call__(self, *args, **kwargs):
+            context = events[-1]
+            if context["aclgraph_runtime_mode"] == GraphMode.NONE:
+                return self.runnable(*args, **kwargs)
+            descriptor = context["batch_descriptor"]
+            entry = self.concrete_aclgraph_entries.get(descriptor)
+            if entry is None:
+                assert capture_events[-1] is True
+                inputs = self.proposer.build_model_inputs_first_pass(descriptor.num_tokens)
+                entry = SimpleNamespace(inputs=inputs, output=None)
+                self.concrete_aclgraph_entries[descriptor] = entry
+                self.captured_batches.append(descriptor.num_reqs)
+            hidden = self.proposer.model(**entry.inputs)
+            output = self.proposer.model.compute_logits(hidden[:, 1:].reshape(-1, self.proposer.hidden_size))
+            output = output.argmax(-1).view(descriptor.num_reqs, -1)
+            if entry.output is None:
+                entry.output = output
+            else:
+                entry.output.copy_(output)
+            return entry.output
 
     @contextmanager
     def forward_context(metadata, config, **kwargs):
@@ -61,7 +103,10 @@ def harness(monkeypatch):
     ):
         register(name)
     register("vllm.config", CUDAGraphMode=GraphMode, VllmConfig=SimpleNamespace)
-    register("vllm.forward_context", get_forward_context=lambda: None)
+    register("vllm.forward_context", get_forward_context=lambda: None, BatchDescriptor=BatchDescriptor)
+    register("vllm.compilation.monitor", set_cudagraph_capturing_enabled=capture_events.append)
+    register("vllm.logger", logger=Mock())
+    register("vllm_ascend.compilation.acl_graph", ACLGraphWrapper=AddressGraph)
     register("vllm.v1.attention.backends.utils", CommonAttentionMetadata=SimpleNamespace)
     register(
         "vllm_ascend.ascend_forward_context", set_ascend_forward_context=forward_context, _EXTRA_CTX=SimpleNamespace()
@@ -109,6 +154,7 @@ def harness(monkeypatch):
         attention=attention,
         adapter=adapter,
         events=events,
+        capture_events=capture_events,
         root=root,
         register=register,
         load=load,
@@ -646,12 +692,184 @@ def test_missing_vendor_bridge_fails_explicitly(harness, missing):
         p.load_model(nn.Identity() if missing == "target" else p._target_model)
 
 
-@pytest.mark.parametrize("field,value", [("enforce_eager", False), ("draft_tensor_parallel_size", 2)])
+@pytest.mark.parametrize("field,value", [("draft_tensor_parallel_size", 2)])
 def test_unsupported_spec_config(harness, field, value):
     cfg = config()
     setattr(cfg.speculative_config, field, value)
     with pytest.raises((ValueError, NotImplementedError)):
         harness.cls(cfg, torch.device("cpu"))
+
+
+def make_graph_proposer(harness, monkeypatch):
+    cfg = config()
+    cfg.speculative_config.enforce_eager = False
+    cfg.speculative_config.draft_model_config.hf_config.rope_parameters = {"mrope_section": [1, 1, 1]}
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config.update(context_topk=4, context_local_window=2)
+    cfg.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=0)
+    cfg.model_config = SimpleNamespace(enforce_eager=True, dtype=torch.bfloat16)
+    p = make_proposer(harness, cfg)
+    p.model.correction = p.model.confidence_head = None
+    p._initialize_graph_buffers()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(synchronize=Mock(), empty_cache=Mock(), mem_get_info=lambda: (1000, 2000)),
+        raising=False,
+    )
+    return p
+
+
+def graph_propose(p, requests, lengths, anchors, rejected=None):
+    p.runner.input_batch.req_ids = requests
+    common = metadata(lengths)
+    common.query_start_loc = torch.arange(len(requests) + 1)
+    return p._propose(
+        None, None, None, torch.tensor(anchors), None, common, None, None, num_rejected_tokens_gpu=rejected
+    )
+
+
+def test_graph_capture_is_independent_of_target_and_profile_is_eager(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    addresses = [context.kv.data_ptr() for context in p._graph_contexts]
+    p.dummy_run(32, num_reqs=4, is_profile=True, aclgraph_runtime_mode=GraphMode.FULL)
+    assert harness.events[-1]["aclgraph_runtime_mode"] == GraphMode.NONE
+    assert p.use_cuda_graph and p.vllm_config.model_config.enforce_eager
+    assert p.capture_model() == 0
+    assert p._runnable.captured_batches == [4, 2, 1]
+    assert harness.capture_events == [True, False]
+    assert p.capture_model() == 0  # No accidental recapture.
+    assert harness.capture_events == [True, False]
+    assert addresses == [context.kv.data_ptr() for context in p._graph_contexts]
+
+
+def test_graph_replay_updates_context_and_pads_requests_without_rebinding(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    p.capture_model()
+    eager_cfg = config()
+    eager_cfg.speculative_config.draft_model_config.hf_config.dflash_config.update(
+        context_topk=4, context_local_window=2
+    )
+    eager = make_proposer(harness, eager_cfg)
+    eager.model.correction = eager.model.confidence_head = None
+    addresses = [context.kv.data_ptr() for context in p._graph_contexts]
+    saved_output = None
+    # Exercise the same bucket with different request order, rejected tokens,
+    # and a dirty fourth row before shrinking to a padded three-request batch.
+    for requests, lengths, anchors, rejected in (
+        (["a", "b", "a", "b"], [5, 9, 6, 10], [3, 4, 8, 9], None),
+        (["b", "a", "b"], [9, 5, 10], [4, 3, 9], torch.tensor([2, 1, 3])),
+        (["a"], [6], [5], None),
+        (["b", "a"], [11, 7], [8, 9], None),
+    ):
+        actual = graph_propose(p, requests, lengths, anchors, rejected)
+        expected = graph_propose(eager, requests, lengths, anchors, rejected)
+        torch.testing.assert_close(actual, expected)
+        batch = len(requests)
+        assert actual.shape == (batch, 7)
+        assert addresses == [context.kv.data_ptr() for context in p._graph_contexts]
+        for context, reference in zip(p._contexts, eager._contexts):
+            torch.testing.assert_close(context.kv[:batch], reference.kv)
+            assert not context.kv[batch:].any()
+            assert not context.valid[batch:].any()
+            assert context.indices[batch:].eq(-1).all()
+        assert not p._target_final_hidden[batch:].any()
+        if saved_output is None:
+            saved_output, saved_value = actual, actual.clone()
+    torch.testing.assert_close(saved_output, saved_value)
+    assert p._runnable.captured_batches == [4, 2, 1]
+    assert p.graph_replay_count == 4
+
+
+def test_graph_refuses_lazy_capture_and_resets_capture_guard_on_failure(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    with pytest.raises(RuntimeError, match="not captured"):
+        graph_propose(p, ["a"], [5], [3])
+    p.dummy_run = Mock(side_effect=RuntimeError("capture failed"))
+    with pytest.raises(RuntimeError, match="capture failed"):
+        p.capture_model()
+    assert harness.capture_events == [True, False]
+    assert not p._graphs_captured
+
+
+def test_graph_text_axes_checked_before_capture_and_every_replay(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    p._graph_text_positions = True
+    with pytest.raises(ValueError, match="mrope_section"):
+        graph_propose(p, ["a"], [5], [3])
+    provider = p._target_model.get_hy_dflash_context
+
+    def text_context(**kwargs):
+        state = provider(**kwargs)
+        return replace(state, query_positions=state.query_positions[:1].expand(3, -1, -1))
+
+    p._target_model.get_hy_dflash_context = text_context
+    p.runner.input_batch.req_ids = ["a"]
+    p.prepare_context(torch.tensor([5]), None, None, None)
+    positions = p.build_model_inputs_first_pass(8)["positions"]
+    assert positions.ndim == 1
+    torch.testing.assert_close(positions, torch.arange(15, 23))
+    p._target_model.get_hy_dflash_context = provider
+    with pytest.raises(ValueError, match="mrope_section"):
+        p.prepare_context(torch.tensor([6]), None, None, None)
+
+
+def test_graph_auxiliary_heads_and_oversize_batches_rejected(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    with pytest.raises(ValueError, match="capacity"):
+        p._graph_batch_size(5)
+    p.model.confidence_head = nn.Linear(4, 1)
+    with pytest.raises(NotImplementedError, match="auxiliary heads"):
+        p._initialize_graph_buffers()
+
+
+@pytest.mark.parametrize("draft_graph", [False, True])
+def test_v1_worker_calls_draft_capture_with_eager_target(harness, monkeypatch, draft_graph):
+    p = make_graph_proposer(harness, monkeypatch)
+    p.use_cuda_graph = draft_graph
+    p.capture_model = Mock(return_value=123)
+    runner_path = harness.root / "vllm_ascend/worker/model_runner_v1.py"
+    cls = next(
+        node
+        for node in ast.parse(runner_path.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
+    )
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in ("has_draft_only_graphs", "capture_model")
+    ]
+    parent_capture = Mock(return_value=456)
+    namespace = dict(
+        AscendHYDflashProposer=harness.cls,
+        _get_gpu_model_runner_module_name=lambda runner: "runner",
+        _torch_cuda_wrapper=nullcontext,
+        _replace_gpu_model_runner_function_wrapper=lambda name: nullcontext(),
+        graph_capture=lambda **kwargs: nullcontext(),
+        GPUModelRunner=SimpleNamespace(capture_model=parent_capture),
+    )
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(runner_path), "exec"), namespace)
+    runner = SimpleNamespace(drafter=p, device="cpu", _freeze_gc=nullcontext)
+    runner.has_draft_only_graphs = lambda: namespace["has_draft_only_graphs"](runner)
+    runner.capture_model = lambda: namespace["capture_model"](runner)
+    worker = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True), model_runner=runner)
+    worker_path = harness.root / "vllm_ascend/worker/worker.py"
+    # Execute the actual worker's capture branch without importing NPU drivers.
+    condition = next(
+        node
+        for node in ast.walk(ast.parse(worker_path.read_text()))
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "npugraph_memory_bytes" for target in child.targets)
+            for child in node.body
+        )
+    )
+    local = dict(self=worker, npugraph_memory_bytes=0)
+    exec(compile(ast.Module(body=[condition], type_ignores=[]), str(worker_path), "exec"), local)
+    assert local["npugraph_memory_bytes"] == (123 if draft_graph else 0)
+    assert p.capture_model.call_count == int(draft_graph)
+    if not draft_graph:
+        assert runner.capture_model() == 456  # Other proposers retain the upstream capture path.
 
 
 @pytest.mark.parametrize(

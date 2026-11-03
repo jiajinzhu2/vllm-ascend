@@ -4362,10 +4362,18 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    def has_draft_only_graphs(self) -> bool:
+        return isinstance(self.drafter, AscendHYDflashProposer) and self.drafter.use_cuda_graph
+
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+            if self.has_draft_only_graphs():
+                # HY's target stays eager, so the upstream dispatcher has no
+                # descriptors. Capture the draft independently on the NPU stream.
+                with self._freeze_gc(), graph_capture(device=self.device):
+                    return self.drafter.capture_model()
             return GPUModelRunner.capture_model(self)
 
     def _prepare_multimodal_fields(self):

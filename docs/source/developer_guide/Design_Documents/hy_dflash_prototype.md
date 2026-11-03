@@ -136,10 +136,10 @@ vllm serve /models/HY4-mxfp8 \
   --max-model-len 4096 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 256 \
-  --speculative-config '{"method":"dflash","model":"/models/HY4-draft-bf16","num_speculative_tokens":7,"draft_tensor_parallel_size":8,"enforce_eager":true,"quantization":null}'
+  --speculative-config '{"method":"dflash","model":"/models/HY4-draft-bf16","num_speculative_tokens":7,"draft_tensor_parallel_size":8,"enforce_eager":false,"quantization":null}'
 ```
 
-Choose TP for the hardware; draft TP must equal target TP. Both models require
+Choose TP for the hardware; draft TP must equal target TP. The target requires
 eager execution, with floating-point target KV, PP/DP/PCP/DCP equal to one,
 no LoRA and no separate LM-head TP. Multimodal target ingestion is outside this
 text-serving adapter's validation.
@@ -149,6 +149,41 @@ The target's learned sink uses a chunked PyTorch reference fallback because
 draft dual-source attention need native kernels for production performance.
 No throughput or acceptance-rate claim is made.
 
+## Draft FULL graphs in model_runner_v1
+
+Keep the top-level `--enforce-eager` for the target, and explicitly set
+`"enforce_eager":false` inside `--speculative-config` for draft graphs. Set it to
+`true` for the eager comparison. No target FULL-graph compilation flag is needed.
+This independent capture entry is implemented for `model_runner_v1`; runner v2
+is not supported by this adapter.
+
+The worker calls the v1 runner's draft capture path even though the target's
+graph dispatcher is disabled. The proposer uses `ACLGraphWrapper` with FULL
+graphs covering slot-0 fusion, all five layers, the seven LM-head projections
+and argmax. Context top-k selection, page gathering, validation and buffer
+copies remain outside the graph. There are no FIA task handles or draft paged
+KV writes in this reference attention implementation.
+
+Capture buckets count **requests**, not target padded tokens: powers of two up
+to `max_num_seqs`, plus `max_num_seqs` itself, captured largest first. For example,
+`max_num_seqs=3` captures batches 3, 2 and 1; `max_num_seqs=4` captures 4, 2 and 1.
+Live batches round up to the next bucket. Per-layer contexts, target fusion
+hidden, token IDs and rotary coordinates keep their allocated addresses.
+Every call updates live rows and clears padded rows; only real requests are
+returned, with proposals copied out of the graph-owned output allocation.
+
+Ordinary text RoPE checks equal axes before replay and passes a one-dimensional
+position view into the graph. Checkpoints with `mrope_section` keep all three
+axes. The host synchronization used for axis validation is outside capture.
+The graph path requires the specified checkpoint without auxiliary heads.
+
+Startup logs `HY DFlash captured FULL draft graphs for request batches ...`.
+The NPU validation script additionally checks real graph objects and nonzero
+replay counts on every TP rank. Graph buffers hold worst-case gathered context
+for `max_num_seqs` requests and are included before memory profiling; start with
+a small `--max-num-seqs` and measure memory before increasing concurrency.
+Actual CANN capture support, TP collectives, memory and speed require NPU testing.
+
 ## Validation
 
 ```bash
@@ -156,7 +191,10 @@ pytest --noconftest tests/ut/spec_decode/test_hy_dflash_proposer.py -q
 ```
 
 These tests cover numerical attention/context gathering, learned sinks, row
-alignment, M-RoPE, no-head drafting, strict loading and quantization isolation.
+alignment, M-RoPE, no-head drafting, strict loading and quantization isolation,
+plus independent capture dispatch, fixed-address replay inputs, padding,
+request reordering and rejection. The graph stand-in retains capture-time
+tensor views; it does not emulate NPU operator capture.
 They replace vLLM/NPU infrastructure with CPU primitives and do not prove CANN,
 distributed or real-checkpoint compatibility.
 
@@ -166,8 +204,14 @@ On the NPU environment, compare greedy outputs with and without speculation:
 python tests/e2e/multicard/test_hy_dflash.py --target /models/HY4-mxfp8 --draft /models/HY4-draft-bf16 --tp 8
 ```
 
-Add short/long contexts, concurrent
-requests, rejection and TP comparisons. Verify target-alone output against a
+The script runs baseline, eager padded/compacted and graph padded/compacted
+engines in separate processes, with long/short contexts, changing batches and
+repeated requests. It compares both final tokens and per-step draft proposals;
+final tokens alone could hide a broken draft with zero acceptance. Its draft
+trace copies synchronize the device and are for correctness, not benchmarking.
+Add `--benchmark-repeats 5` to time additional generations with tracing disabled
+and report output tokens per second separately for each engine mode.
+Verify target-alone output against a
 trusted HY4 implementation before interpreting draft acceptance. For incorrect
 draft output, compare selected logical indices, physical KV slots, latent/RoPE
 KV, fusion output and the first divergent layer's attention output.

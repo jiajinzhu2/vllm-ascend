@@ -504,7 +504,7 @@ class NPUWorker(WorkerBase):
             self.model_runner._dummy_run(size)
 
         npugraph_memory_bytes = 0
-        if not self.model_config.enforce_eager:
+        if not self.model_config.enforce_eager or getattr(self.model_runner, "has_draft_only_graphs", lambda: False)():
             npugraph_memory_bytes = self.model_runner.capture_model()
 
         # Suggest an optimal --kv-cache-memory value for future runs.

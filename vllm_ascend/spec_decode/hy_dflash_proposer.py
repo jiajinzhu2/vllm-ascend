@@ -11,16 +11,21 @@ from copy import copy
 from typing import Any
 
 import torch
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import BatchDescriptor
+from vllm.logger import logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.hy_dflash import (
+    HYContext,
     HYTargetLayerState,
     HYTargetState,
     gather_context,
     select_context_indices,
 )
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.patch.hy4_config import get_hy_dflash_config
 from vllm_ascend.patch.worker.hy_dflash import HYDflashAdapter
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
@@ -28,7 +33,7 @@ from vllm_ascend.utils import lmhead_tp_enable
 
 
 class AscendHYDflashProposer(AscendDflashProposer):
-    """Eager KV-share backbone with optional checkpoint-supplied output heads."""
+    """KV-share backbone with independent v1 draft graph capture/replay."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         hf_config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -60,11 +65,22 @@ class AscendHYDflashProposer(AscendDflashProposer):
         self.confidence_request_ids: tuple[str, ...] = ()
         self._target_model = None
         self._target_row_indices = None
+        # The target's sink fallback remains eager. Its dispatcher consequently
+        # has no capture descriptors; draft graph dispatch must be independent.
+        self.use_cuda_graph = self.speculative_config.enforce_eager is False
+        self.graph_batch_sizes = tuple(
+            sorted({self.max_batch_size, *(1 << i for i in range(self.max_batch_size.bit_length()))})
+        )
+        self._graph_contexts = ()
+        self._graphs_captured = False
+        self.graph_replay_count = 0
+        rope = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
+        self._graph_text_positions = rope.get("mrope_section") is None
 
     @staticmethod
     def _validate_config(vllm_config: VllmConfig) -> None:
         # Matched TP uses the native sharded projections; other distributed
-        # layouts and graphs need additional cache/row-mapping integration.
+        # layouts need additional cache/row-mapping integration.
         # Check capabilities once; model dimensions belong to the checkpoint.
         spec = vllm_config.speculative_config
         unsupported = [
@@ -80,7 +96,6 @@ class AscendHYDflashProposer(AscendDflashProposer):
         unsupported += [
             name
             for name, enabled in (
-                ("ACL graphs", not spec.enforce_eager),
                 (
                     "draft TP must equal target TP",
                     spec.draft_tensor_parallel_size != getattr(vllm_config.parallel_config, "tensor_parallel_size", 1),
@@ -91,7 +106,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
             if enabled
         ]
         if unsupported:
-            raise NotImplementedError("HY eager KV-share does not implement: " + ", ".join(unsupported))
+            raise NotImplementedError("HY KV-share does not implement: " + ", ".join(unsupported))
         model_config = getattr(vllm_config, "model_config", None)
         if model_config is not None and not model_config.enforce_eager:
             raise NotImplementedError("HY target sink fallback and indexer capture require target enforce_eager")
@@ -161,6 +176,63 @@ class AscendHYDflashProposer(AscendDflashProposer):
             raise ValueError("HY draft dimensions and target KV layer mapping must match the model configuration")
         self._draft_attn_layer_names = set()
         self.draft_attn_groups = []
+        if self.use_cuda_graph:
+            self._initialize_graph_buffers()
+
+    def _initialize_graph_buffers(self) -> None:
+        if self.model.correction is not None or self.model.confidence_head is not None:
+            raise NotImplementedError("HY draft graphs require the checkpoint without auxiliary heads")
+        # Allocate before memory profiling. Every bucket uses views of these
+        # buffers, including profiling, capture and subsequent request batches.
+        self._graph_contexts = self.model.dummy_contexts(
+            self.max_batch_size, self.context_topk + self.context_local_window
+        )
+        self._graph_target_hidden = torch.zeros(
+            (self.max_batch_size, self.hidden_size), dtype=self.dtype, device=self.device
+        )
+        self._runnable = ACLGraphWrapper(
+            self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL, use_eagle=True
+        )
+
+    def _graph_batch_size(self, batch: int) -> int:
+        if not 0 < batch <= self.max_batch_size:
+            raise ValueError(f"HY draft batch {batch} exceeds capacity {self.max_batch_size}")
+        return next(size for size in self.graph_batch_sizes if size >= batch)
+
+    def _select_graph_buffers(self, batch: int) -> None:
+        self._contexts = tuple(
+            HYContext(context.layer_id, context.indices[:batch], context.kv[:batch], context.valid[:batch])
+            for context in self._graph_contexts
+        )
+        self._target_final_hidden = self._graph_target_hidden[:batch]
+
+    def _graph_descriptor(self, batch: int) -> BatchDescriptor:
+        return BatchDescriptor(num_tokens=batch * self.query_block_size, num_reqs=batch, uniform=True)
+
+    @torch.inference_mode()
+    def capture_model(self) -> int:
+        """Called by model_runner_v1 on its capture stream, even for eager target."""
+        if not self.use_cuda_graph or self._graphs_captured:
+            return 0
+        torch.npu.synchronize()
+        torch.npu.empty_cache()
+        free_before = torch.npu.mem_get_info()[0]
+        warmups = max(1, self.vllm_config.compilation_config.cudagraph_num_of_warmups)
+        set_cudagraph_capturing_enabled(True)
+        try:
+            # Largest first: all buckets share the normal ACLGraphWrapper pool.
+            for batch in reversed(self.graph_batch_sizes):
+                count = batch * self.query_block_size
+                for _ in range(warmups):
+                    self.dummy_run(count, num_reqs=batch)
+                self.dummy_run(count, num_reqs=batch, aclgraph_runtime_mode=CUDAGraphMode.FULL)
+                torch.npu.synchronize()
+        finally:
+            set_cudagraph_capturing_enabled(False)
+        self._graphs_captured = True
+        used = free_before - torch.npu.mem_get_info()[0]
+        logger.info("HY DFlash captured FULL draft graphs for request batches %s", self.graph_batch_sizes)
+        return used
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         """Bind target KV groups, not ordinary DFlash's new context-cache group.
@@ -258,8 +330,32 @@ class AscendHYDflashProposer(AscendDflashProposer):
                 local_window=self.context_local_window,
             )
             contexts.append(gather_context(layer, indices))
-        self._contexts = tuple(contexts)
-        self._target_final_hidden = state.final_hidden
+        if self.use_cuda_graph:
+            # Validate outside capture: torch.equal synchronizes with the host.
+            # Text-only RoPE then receives a 1-D view, avoiding that check in
+            # each captured layer. Check every live batch, including replays.
+            if self._graph_text_positions and not torch.equal(
+                state.query_positions, state.query_positions[:1].expand_as(state.query_positions)
+            ):
+                raise ValueError("Distinct HY M-RoPE axes require checkpoint mrope_section")
+            padded = self._graph_batch_size(batch)
+            self._select_graph_buffers(padded)
+            for destination, source in zip(self._contexts, contexts, strict=True):
+                destination.indices[:batch].copy_(source.indices)
+                destination.kv[:batch].copy_(source.kv)
+                destination.valid[:batch].copy_(source.valid)
+                destination.indices[batch:].fill_(-1)
+                destination.kv[batch:].zero_()
+                destination.valid[batch:].zero_()
+            self._target_final_hidden[:batch].copy_(state.final_hidden)
+            self._target_final_hidden[batch:].zero_()
+            self.input_ids[batch * self.query_block_size : padded * self.query_block_size].fill_(
+                self.parallel_drafting_token_id
+            )
+            self.mrope_positions[:, batch * self.query_block_size : padded * self.query_block_size].zero_()
+        else:
+            self._contexts = tuple(contexts)
+            self._target_final_hidden = state.final_hidden
         self.mrope_positions[:, : batch * self.query_block_size].copy_(state.query_positions.reshape(3, -1))
         self.confidence_request_ids = request_ids
 
@@ -327,9 +423,12 @@ class AscendHYDflashProposer(AscendDflashProposer):
 
     def build_model_inputs_first_pass(self, num_input_tokens: int) -> dict[str, Any]:
         batch = num_input_tokens // self.query_block_size
+        positions = self.mrope_positions[:, :num_input_tokens].view(3, batch, self.query_block_size)
+        if self.use_cuda_graph and self._graph_text_positions:
+            positions = positions[0].reshape(-1)
         return {
             "input_ids": self.input_ids[:num_input_tokens].view(batch, self.query_block_size),
-            "positions": self.mrope_positions[:, :num_input_tokens].view(3, batch, self.query_block_size),
+            "positions": positions,
             "target_final_hidden": self._target_final_hidden,
             "contexts": self._contexts,
         }
@@ -360,23 +459,37 @@ class AscendHYDflashProposer(AscendDflashProposer):
             common_attn_metadata,
             num_rejected_tokens_gpu,
         )
+        batch = metadata.num_reqs
+        padded = self._graph_batch_size(batch) if self.use_cuda_graph else batch
+        count = padded * self.query_block_size
+        mode = CUDAGraphMode.FULL if self.use_cuda_graph else CUDAGraphMode.NONE
+        descriptor = self._graph_descriptor(padded) if self.use_cuda_graph else None
+        if self.use_cuda_graph and not self._graphs_captured:
+            raise RuntimeError("HY draft graphs were not captured by model_runner_v1 during warmup")
         with set_ascend_forward_context(
             None,
             self.vllm_config,
-            num_tokens=num_tokens,
+            num_tokens=count,
             num_actual_tokens=num_tokens,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            aclgraph_runtime_mode=mode,
+            batch_descriptor=descriptor,
             is_draft_model=True,
         ):
-            return self._runnable(
-                num_input_tokens=num_tokens,
-                batch_size=metadata.num_reqs,
+            output = self._runnable(
+                num_input_tokens=count,
+                batch_size=padded,
                 token_indices_to_sample=indices,
                 target_positions=target_positions,
                 inputs_embeds=None,
                 multi_steps_attn_metadata=[],
-                num_tokens=num_tokens,
+                num_tokens=count,
             )
+        if self.use_cuda_graph:
+            self.graph_replay_count += 1
+            # Replaying the same graph overwrites its output allocation. The
+            # scheduler/rejection sampler owns the returned proposals instead.
+            return output[:batch].clone()
+        return output
 
     def _run_merged_draft(
         self,
@@ -437,8 +550,22 @@ class AscendHYDflashProposer(AscendDflashProposer):
             num_reqs = min(self.max_batch_size, max(1, num_tokens // self.query_block_size))
         # No live target read/write and no context projection. Allocate worst-case
         # gathered context for memory profiling, even though all entries are masked.
-        self._contexts = self.model.dummy_contexts(num_reqs, self.context_topk + self.context_local_window)
-        self._target_final_hidden = torch.zeros((num_reqs, self.hidden_size), dtype=self.dtype, device=self.device)
+        mode = CUDAGraphMode.NONE
+        descriptor = None
+        if self.use_cuda_graph:
+            num_reqs = self._graph_batch_size(num_reqs)
+            self._select_graph_buffers(num_reqs)
+            for context in self._contexts:
+                context.indices.fill_(-1)
+                context.kv.zero_()
+                context.valid.zero_()
+            self._target_final_hidden.zero_()
+            if not is_profile and aclgraph_runtime_mode == CUDAGraphMode.FULL:
+                mode = CUDAGraphMode.FULL
+                descriptor = self._graph_descriptor(num_reqs)
+        else:
+            self._contexts = self.model.dummy_contexts(num_reqs, self.context_topk + self.context_local_window)
+            self._target_final_hidden = torch.zeros((num_reqs, self.hidden_size), dtype=self.dtype, device=self.device)
         count = num_reqs * self.query_block_size
         self.input_ids[:count].fill_(self.parallel_drafting_token_id)
         self.input_ids[: count : self.query_block_size].zero_()
@@ -450,7 +577,8 @@ class AscendHYDflashProposer(AscendDflashProposer):
             self.vllm_config,
             num_tokens=count,
             num_actual_tokens=count,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            aclgraph_runtime_mode=mode,
+            batch_descriptor=descriptor,
             is_draft_model=True,
             in_profile_run=is_profile,
         ):
