@@ -27,6 +27,12 @@
 # ----------------------------------------------------------------------------------
 
 # What's Patched and how it works:
+# HY4 0.20.2 compatibility:
+# - hy4_config.py registers missing HY4/DFlash configs and the HY4 MLA converter
+#   through the general model plugin; it does not replace unrelated converters.
+# - worker/hy_dflash_model.py composes the BF16 draft from loaded HY4 projections
+#   without persistent draft attention/indexer caches. Remove this compatibility
+#   layer when upstream provides the same private-checkpoint contract.
 # --------------------------------
 # * Platform Patch:
 # =================

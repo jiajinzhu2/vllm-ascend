@@ -18,6 +18,7 @@
 #
 
 
+from vllm_ascend.patch.hy4_config import is_hy_dflash
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -44,8 +45,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
         draft_config = vllm_config.speculative_config.draft_model_config.hf_config
-        dflash_config = getattr(draft_config, "dflash_config", {}) or {}
-        if dflash_config.get("ascend_proposer") == "hy":
+        if is_hy_dflash(draft_config):
             return AscendHYDflashProposer(vllm_config, device, runner)
         return AscendDflashProposer(vllm_config, device, runner)
     elif method == "draft_model":

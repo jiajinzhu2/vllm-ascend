@@ -13,7 +13,10 @@ import __future__
 
 import ast
 import importlib.util
+import json
+import struct
 import sys
+import typing
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from enum import Enum
@@ -95,6 +98,7 @@ def harness(monkeypatch):
         spec.loader.exec_module(module)
         return module
 
+    config_module = load("vllm_ascend.patch.hy4_config", "vllm_ascend/patch/hy4_config.py")
     attention = load("vllm_ascend.attention.hy_dflash", "vllm_ascend/attention/hy_dflash.py")
     adapter = load("vllm_ascend.patch.worker.hy_dflash", "vllm_ascend/patch/worker/hy_dflash.py")
     parent = load("vllm_ascend.spec_decode.dflash_proposer", "vllm_ascend/spec_decode/dflash_proposer.py")
@@ -108,6 +112,7 @@ def harness(monkeypatch):
         root=root,
         register=register,
         load=load,
+        config_module=config_module,
     )
 
 
@@ -652,7 +657,6 @@ def test_unsupported_spec_config(harness, field, value):
 @pytest.mark.parametrize(
     "field",
     [
-        "tensor_parallel_size",
         "pipeline_parallel_size",
         "data_parallel_size",
         "prefill_context_parallel_size",
@@ -794,3 +798,395 @@ def test_invalid_context_configuration(harness, field, value):
     cfg.speculative_config.draft_model_config.hf_config.dflash_config[field] = value
     with pytest.raises(ValueError, match="HY requires"):
         harness.cls(cfg, torch.device("cpu"))
+
+
+def test_hy_checkpoint_keeps_hidden_kv_and_indexer_maps_distinct(harness):
+    c = harness.config_module.HYDflashConfig(
+        architectures=["hy4dflymodels"],
+        num_hidden_layers=5,
+        target_layer_ids=[60, 64, 68, 72, 76],
+        target_kv_layers=[61, 65, 69, 73, 77],
+        target_index_layers=[61, 65, 69, 73, 77],
+        target_init_attn_layers=[61, 65, 69, 73, 77],
+    )
+    assert c.dflash_config["target_layer_ids"] == [60, 64, 68, 72, 76]
+    assert c.dflash_config["target_kv_layers"] == [61, 65, 69, 73, 77]
+    cfg = config()
+    cfg.speculative_config.draft_model_config.hf_config = c
+    p = harness.cls(cfg, torch.device("cpu"))
+    assert p.target_layer_ids == p.target_index_layers == (61, 65, 69, 73, 77)
+
+
+def test_checkpoint_conflicting_layer_maps_fail(harness):
+    with pytest.raises(ValueError, match="Conflicting"):
+        harness.config_module.HYDflashConfig(
+            architectures=["hy4dflymodels"],
+            num_hidden_layers=1,
+            target_layer_ids=[60],
+            dflash_config={"target_layer_ids": [61]},
+        )
+
+
+def test_matched_target_and_draft_tp(harness):
+    cfg = config()
+    cfg.parallel_config.tensor_parallel_size = 8
+    cfg.speculative_config.draft_tensor_parallel_size = 8
+    harness.cls(cfg, torch.device("cpu"))
+
+
+def test_no_heads_batches_all_seven_logits_once(harness):
+    p = make_proposer(harness)
+    p.model.correction = p.model.confidence_head = None
+    calls = []
+    del p.model.logits_callback
+    p.model.logits_callback = lambda h: calls.append(h.clone()) or torch.arange(9).expand(h.shape[0], -1)
+    result = propose(p)
+    assert result.shape == (2, 7) and (result == 8).all()
+    assert len(calls) == 1 and calls[0].shape == (14, 4)
+    assert p.confidence_logits is None and p.verification_probs() is None
+
+
+def test_bf16_loader_does_not_inherit_or_mutate_target_quantization(harness):
+    p = make_proposer(harness)
+    target_quant = object()
+    target_config = SimpleNamespace(dtype=torch.float16, quantization="ascend")
+    p.vllm_config.model_config = target_config
+    p.vllm_config.quant_config = target_quant
+    p.speculative_config.draft_parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    draft_config = p.speculative_config.draft_model_config
+    draft_config.quantization = None
+    draft_config.dtype = torch.float16
+    captured = []
+    harness.register("vllm.compilation.backends", set_model_tag=lambda _: nullcontext())
+    harness.register("vllm.model_executor.model_loader", get_model=lambda **kw: captured.append(kw) or "model")
+    assert p._get_model() == "model"
+    loaded = captured[0]["vllm_config"]
+    assert loaded.quant_config is None and loaded.model_config.dtype is torch.bfloat16
+    assert p.vllm_config.quant_config is target_quant
+    assert target_config.dtype is torch.float16 and target_config.quantization == "ascend"
+    assert draft_config.dtype is torch.float16
+
+
+def test_compacted_rows_index_original_target_buffer(harness):
+    p = make_proposer(harness)
+    p.target_kv_cache_group_ids = (0,) * 5
+    p._target_row_indices = torch.tensor([0, 1, 4, 5, 6])
+    p.target_index_layers = (1, 5, 9, 13, 17)
+    table = torch.tensor([[0, 1], [2, 3]])
+    p.runner.input_batch.block_table = {0: SimpleNamespace(get_device_tensor=lambda: table)}
+    pages = [torch.zeros(4, 4, 1, 3), torch.zeros(4, 4, 1, 6)]
+    seen_layers = []
+
+    def index_buffer(layer):
+        seen_layers.append(layer)
+        return torch.arange(7)[:, None]
+
+    p._target_model = SimpleNamespace(
+        get_hy_dflash_attention=lambda _: SimpleNamespace(
+            mla_attn=SimpleNamespace(mla_attn=SimpleNamespace(kv_cache=pages))
+        ),
+        get_hy_dflash_topk_buffer=index_buffer,
+    )
+    rows = torch.tensor([1, 4])
+    hidden = torch.randn(5, 4)
+    state = p._target_state_from_main_model(torch.tensor([2, 7]), torch.arange(5), hidden, rows)
+    assert state.layers[0].topk_indices[:, 0].tolist() == [1, 6]
+    torch.testing.assert_close(state.final_hidden, hidden[rows])
+    assert seen_layers == [1, 5, 9, 13, 17]
+
+
+def test_rejected_rows_without_explicit_sample_indices(harness):
+    p = make_proposer(harness)
+    seen = []
+    p.prepare_context = lambda *args: seen.append(args[-1].clone())
+    meta = metadata((9, 11))
+    meta.query_start_loc = torch.tensor([0, 8, 16])
+    p.set_inputs_first_pass(None, torch.tensor([3, 4]), None, None, None, meta, torch.tensor([6, 2]))
+    assert seen[0].tolist() == [1, 13]
+
+
+def test_three_axis_rotary_selects_pairs_without_collapsing(harness):
+    positions = torch.tensor([[[1, 2]], [[11, 12]], [[21, 22]]])
+    q, k = torch.zeros(2, 2, 6), torch.zeros(2, 1, 6)
+
+    def rotary(pos, query, key):
+        return query + pos[:, None, None], key + pos[:, None, None]
+
+    rotated_q, rotated_k = harness.attention.apply_hy_rotary(rotary, positions, q, k, sections=[1, 1, 1])
+    assert rotated_q[0, 0].tolist() == [1, 1, 11, 11, 21, 21]
+    assert rotated_k[1, 0].tolist() == [2, 2, 12, 12, 22, 22]
+    with pytest.raises(ValueError, match="mrope_section"):
+        harness.attention.apply_hy_rotary(rotary, positions, q, k)
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_sparse_target_sink_matches_explicit_attention(harness, padded):
+    torch.manual_seed(72)
+    q, qr = torch.randn(3, 2, 3), torch.randn(3, 2, 2)
+    cache, rope = torch.randn(4, 2, 1, 3), torch.randn(4, 2, 1, 2)
+    table = torch.tensor([[1, 0], [3, 2]])
+    indices = torch.tensor([[0, 1, 2, -1], [0, 1, 2, 3], [0, 1, 2, -1]])
+    if padded:
+        q, qr = torch.cat((q, torch.randn(1, 2, 3))), torch.cat((qr, torch.randn(1, 2, 2)))
+        indices = torch.cat((indices, torch.full((1, 4), 9999)))
+    sinks, scale = torch.tensor([2.0, -1.0]), 0.4
+    actual = harness.attention.sparse_mla_with_sink(q, qr, cache, rope, indices, table, [2, 3], [3, 2], scale, sinks)
+    expected = []
+    for row, (req, position) in enumerate(((0, 1), (0, 2), (1, 1))):
+        keep = indices[row][(indices[row] >= 0) & (indices[row] <= position)]
+        keys = torch.stack([cache[table[req, token // 2], token % 2, 0] for token in keep])
+        rope_keys = torch.stack([rope[table[req, token // 2], token % 2, 0] for token in keep])
+        scores = (q[row] @ keys.T + qr[row] @ rope_keys.T) * scale
+        probs = torch.cat((scores, sinks[:, None]), -1).softmax(-1)
+        expected.append(probs[:, :-1] @ keys)
+    torch.testing.assert_close(actual[:3], torch.stack(expected))
+    if padded:
+        assert torch.count_nonzero(actual[3]) == 0
+
+
+def test_draft_sink_changes_denominator(harness):
+    args = attention_inputs(harness)
+    normal = harness.attention.absorbed_mla(*args)
+    with_sink = harness.attention.absorbed_mla(*args, sinks=torch.full((2,), 80.0))
+    assert normal.abs().max() > 0.01
+    assert with_sink.abs().max() < 1e-20
+
+
+def test_profile_without_request_count_still_runs_draft(harness):
+    p = make_proposer(harness)
+    p.model.correction = p.model.confidence_head = None
+    p.dummy_run(16, is_profile=True)
+    assert len(p._contexts) == 5 and p._contexts[0].kv.shape[0] == 2
+
+
+@pytest.fixture
+def checkpoint_model(harness):
+    """Run real HY4 attention construction/loading with CPU linear primitives.
+
+    This does not mock the checkpoint wrapper or its load_weights method.
+    Distributed collectives and NPU kernels still require the system test.
+    """
+
+    def default_loader(param, weight):
+        assert param.shape == weight.shape
+        with torch.no_grad():
+            param.copy_(weight)
+
+    class Linear(nn.Linear):
+        def __init__(self, input_size, output_size, bias=False, **kwargs):
+            super().__init__(input_size, output_size, bias=bias)
+            self.weight.weight_loader = default_loader
+
+        def forward(self, hidden):
+            return super().forward(hidden), None
+
+    class PackedLinear(Linear):
+        def __init__(self, input_size, sizes, **kwargs):
+            super().__init__(input_size, sum(sizes), **kwargs)
+            self.sizes = sizes
+            self.weight.weight_loader = self.load_shard
+
+        def load_shard(self, param, weight, shard=None):
+            if shard is None:
+                default_loader(param, weight)
+            else:
+                default_loader(param.narrow(0, sum(self.sizes[:shard]), self.sizes[shard]), weight)
+
+    class Embedding(nn.Embedding):
+        def __init__(self, vocab, hidden, **kwargs):
+            super().__init__(vocab, hidden)
+            self.weight.weight_loader = default_loader
+
+    class MLP(nn.Module):
+        def __init__(self, hidden, intermediate, *args, **kwargs):
+            super().__init__()
+            self.gate_up_proj = PackedLinear(hidden, [intermediate, intermediate])
+            self.down_proj = Linear(intermediate, hidden)
+
+        def forward(self, hidden):
+            gate, up = self.gate_up_proj(hidden)[0].chunk(2, dim=-1)
+            return self.down_proj(torch.nn.functional.silu(gate) * up)[0]
+
+    def get_rope(*args, **kwargs):
+        return lambda positions, query, key: (query, key)
+
+    # Execute the actual HY attention class. Its draft-only constructor must
+    # never touch Indexer, MLAModules or AscendMultiHeadLatentAttention.
+    source = harness.root / "vllm_ascend/models/hy_v4.py"
+    tree = ast.parse(source.read_text())
+    nodes = [
+        node for node in tree.body if getattr(node, "name", "") in ("HYV4MLAAttention", "compute_skip_topk_layers")
+    ]
+    namespace = dict(
+        nn=nn,
+        torch=torch,
+        get_tensor_model_parallel_world_size=lambda: 1,
+        DeepSeekV2FusedQkvAProjLinear=PackedLinear,
+        RMSNorm=nn.RMSNorm,
+        ColumnParallelLinear=Linear,
+        RowParallelLinear=Linear,
+        get_rope=get_rope,
+        _SPARSE_LAYER_TYPES={"sparse_attention"},
+    )
+    exec(
+        compile(
+            ast.Module(body=nodes, type_ignores=[]), str(source), "exec", flags=__future__.annotations.compiler_flag
+        ),
+        namespace,
+    )
+    harness.register("vllm_ascend.models.hy_v4", HYV4MLAAttention=namespace["HYV4MLAAttention"])
+    harness.register("vllm_ascend.models.deepseek_v4", DeepseekV2MLP=MLP)
+    harness.register(
+        "vllm.distributed", get_tensor_model_parallel_rank=lambda: 0, get_tensor_model_parallel_world_size=lambda: 1
+    )
+    harness.register("vllm.model_executor.layers.layernorm", RMSNorm=nn.RMSNorm)
+    harness.register("vllm.model_executor.layers.linear", ReplicatedLinear=Linear)
+    harness.register(
+        "vllm.model_executor.layers.vocab_parallel_embedding",
+        VocabParallelEmbedding=Embedding,
+        ParallelLMHead=Embedding,
+    )
+    harness.register(
+        "vllm.model_executor.layers.logits_processor",
+        LogitsProcessor=lambda _: lambda head, hidden: hidden @ head.weight.T,
+    )
+    harness.register("vllm.model_executor.model_loader.weight_utils", default_weight_loader=default_loader)
+    module = harness.load("vllm_ascend.patch.worker.hy_dflash_model", "vllm_ascend/patch/worker/hy_dflash_model.py")
+    cfg = harness.config_module.HYDflashConfig(
+        architectures=["hy4dflymodels"],
+        num_hidden_layers=5,
+        target_layer_ids=[60, 64, 68, 72, 76],
+        target_kv_layers=[61, 65, 69, 73, 77],
+        target_index_layers=[61, 65, 69, 73, 77],
+        hidden_size=4,
+        intermediate_size=12,
+        num_attention_heads=2,
+        q_lora_rank=3,
+        kv_lora_rank=3,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=6,
+        v_head_dim=2,
+        rms_norm_eps=1e-5,
+        vocab_size=19,
+    )
+    vconfig = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=cfg, dtype=torch.bfloat16), quant_config=None, cache_config=None
+    )
+    original_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        model = module.HY4DflyModels(vllm_config=vconfig)
+    finally:
+        torch.set_default_dtype(original_dtype)
+    weights = [
+        (name, torch.randn_like(param))
+        for name, param in model.named_parameters()
+        if name not in ("model.embed_tokens.weight", "lm_head.weight")
+    ]
+    return model, weights
+
+
+def test_checkpoint_loads_bf16_backbone_and_shares_optional_modules(harness, checkpoint_model):
+    model, weights = checkpoint_model
+    model.load_weights(iter(weights))
+    embed, head = nn.Embedding(19, 4).to(torch.bfloat16), nn.Linear(4, 19).to(torch.bfloat16)
+    target = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=4, vocab_size=19, num_hidden_layers=78),
+        model=SimpleNamespace(embed_tokens=embed),
+        lm_head=head,
+        compute_logits=head,
+        get_hy_dflash_attention=lambda _: SimpleNamespace(kv_lora_rank=3, qk_rope_head_dim=6),
+    )
+    adapter = model.to_hy_dflash_adapter(target)
+    assert adapter.embed_tokens is embed
+    assert adapter.correction is None and adapter.confidence_head is None
+    assert adapter.target_layer_ids == (61, 65, 69, 73, 77)
+    assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+    hidden = adapter(
+        torch.zeros(1, 8, dtype=torch.long),
+        torch.arange(8).expand(3, 1, -1),
+        torch.zeros(1, 4, dtype=torch.bfloat16),
+        adapter.dummy_contexts(1, 4),
+    )
+    assert hidden.shape == (1, 8, 4) and torch.isfinite(hidden).all()
+    assert adapter.compute_logits(hidden[:, 1:].reshape(-1, 4)).shape == (7, 19)
+
+
+def test_missing_trained_fusion_gate_is_not_randomly_initialized(checkpoint_model):
+    model, weights = checkpoint_model
+    with pytest.raises(ValueError, match="model.fusion.gate"):
+        model.load_weights((name, weight) for name, weight in weights if name != "model.fusion.gate")
+
+
+def test_draft_does_not_cast_quantized_weight_bytes_to_bf16(checkpoint_model):
+    model, weights = checkpoint_model
+    name, value = weights[0]
+    with pytest.raises(ValueError, match="unquantized checkpoint"):
+        model.load_weights([(name, value.to(torch.float8_e4m3fn))])
+
+
+def test_missing_half_of_fused_weight_is_detected(checkpoint_model):
+    model, weights = checkpoint_model
+    name = "model.layers.0.self_attn.fused_qkv_a_proj.weight"
+    q_half = dict(weights)[name][:3]
+    weights = [(key, value) for key, value in weights if key != name]
+    weights.append(("model.layers.0.self_attn.q_a_proj.weight", q_half))
+    with pytest.raises(ValueError, match="fused_qkv_a_proj"):
+        model.load_weights(iter(weights))
+
+
+def test_vendor_weight_mapping_must_be_explicit(checkpoint_model):
+    model, weights = checkpoint_model
+    weights = [("mtp_fusion.channel_gate" if name == "model.fusion.gate" else name, value) for name, value in weights]
+    with pytest.raises(ValueError, match="Unknown HY draft weight"):
+        model.load_weights(iter(weights))
+    model.config.dflash_config["weight_name_mapping"] = {"mtp_fusion.channel_gate": "model.fusion.gate"}
+    model.load_weights(iter(weights))
+    assert model._weights_loaded
+
+
+def test_public_hy4_full_indexer_schedule(harness):
+    config = harness.config_module.HYV4Config(num_hidden_layers=78)
+    assert all(config.indexer_types[i] == "full" for i in (61, 65, 69, 73, 77))
+    assert all(config.indexer_types[i] == "shared" for i in (60, 64, 68, 72, 76))
+
+
+def test_fused_mxfp8_expert_scales_do_not_load_as_weights(harness):
+    source = harness.root / "vllm_ascend/models/hy_v4.py"
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendHYV4ForCausalLM")
+    method = next(node for node in cls.body if getattr(node, "name", "") == "_load_fused_experts")
+    method.decorator_list = []
+
+    namespace = {"typing": typing, "Callable": typing.Callable, "torch": torch}
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]), str(source), "exec", flags=__future__.annotations.compiler_flag
+        ),
+        namespace,
+    )
+    calls = []
+    param = SimpleNamespace(
+        weight_loader=lambda p, w, name, **kw: calls.append((w.clone(), name, kw["shard_id"])) or True
+    )
+    params = {"model.layers.1.mlp.experts.w13_weight_scale": param}
+    mappings = [("experts.w13_", "experts.0.gate_proj.", 0, "w1"), ("experts.w13_", "experts.0.up_proj.", 0, "w3")]
+    scales = torch.arange(12, dtype=torch.uint8).view(1, 4, 3)
+    loaded = set()
+    assert namespace["_load_fused_experts"](
+        "model.layers.1.mlp.experts.gate_up_proj.weight_scale", scales, params, mappings, loaded
+    )
+    assert loaded == set(params)
+    assert len(calls) == 2 and calls[0][2] == "w1" and calls[1][2] == "w3"
+    torch.testing.assert_close(calls[0][0], scales[0, :2])
+    torch.testing.assert_close(calls[1][0], scales[0, 2:])
+
+
+def test_checkpoint_inspector_reads_only_header(harness, tmp_path):
+    module = harness.load("inspect_hy_checkpoint", "tools/inspect_hy_dflash_checkpoint.py")
+    (tmp_path / "config.json").write_text('{"architectures": ["hy4dflymodels"]}')
+    header = json.dumps({"model.fusion.gate": {"dtype": "BF16", "shape": [6144], "data_offsets": [0, 12288]}}).encode()
+    (tmp_path / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
+    report = module.inspect_checkpoint(tmp_path)
+    assert report["tensors"]["model.fusion.gate"]["shape"] == [6144]
+    assert report["config"]["architectures"] == ["hy4dflymodels"]

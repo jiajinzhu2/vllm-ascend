@@ -13,6 +13,28 @@ import torch
 from torch import nn
 
 
+def apply_hy_rotary(rotary, positions, query, key, *, sections=None):
+    """Preserve HY's interleaved rotary pairs across all three M-RoPE axes."""
+    if positions.ndim == 1:
+        return rotary(positions, query, key)
+    coordinates = positions.reshape(3, -1)
+    if sections is None:
+        if not torch.equal(coordinates, coordinates[:1].expand_as(coordinates)):
+            raise ValueError("Distinct HY M-RoPE axes require checkpoint mrope_section")
+        return rotary(coordinates[0], query, key)
+    if len(sections) != 3 or sum(sections) * 2 != query.shape[-1]:
+        raise ValueError("HY mrope_section must partition the rotary pairs into three axes")
+    rotated = [rotary(axis, query.clone(), key.clone()) for axis in coordinates]
+    query_parts, key_parts = [], []
+    start = 0
+    for axis, pairs in enumerate(sections):
+        end = start + 2 * pairs
+        query_parts.append(rotated[axis][0][..., start:end])
+        key_parts.append(rotated[axis][1][..., start:end])
+        start = end
+    return torch.cat(query_parts, dim=-1), torch.cat(key_parts, dim=-1)
+
+
 @dataclass(frozen=True)
 class HYTargetLayerState:
     """One target layer, in current request order; all tensors are read-only.
@@ -122,6 +144,7 @@ def absorbed_mla(
     key_up: torch.Tensor,  # [heads, nope_dim, rank]
     value_up: torch.Tensor,  # [heads, value_dim, rank]
     scale: float,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One joint softmax over selected context + causal current-block keys.
 
@@ -140,9 +163,47 @@ def absorbed_mla(
     allowed = torch.cat(
         (context.valid[:, None, :].expand(-1, query_len, -1), causal[None].expand(batch, -1, -1)), dim=-1
     )
-    probabilities = (scores * scale).masked_fill(~allowed[:, None], float("-inf")).softmax(dim=-1)
+    scores = (scores * scale).masked_fill(~allowed[:, None], float("-inf"))
+    if sinks is not None:
+        sink_scores = sinks.float()[None, :, None, None].expand(batch, -1, query_len, 1)
+        probabilities = torch.cat((scores, sink_scores), dim=-1).softmax(dim=-1)[..., :-1]
+    else:
+        probabilities = scores.softmax(dim=-1)
     latent_output = torch.einsum("bhqs,bsr->bqhr", probabilities, latent.float())
     return torch.einsum("bqhr,hvr->bqhv", latent_output, value_up.float()).to(query_nope.dtype)
+
+
+def sparse_mla_with_sink(query, query_rope, cache, rope_cache, indices, table, query_ends, seq_lens, scale, sinks):
+    """Bounded PyTorch fallback for HY4's learned sink on 0.20.2 SFA.
+
+    The old kernel has no sink argument or LSE output. Ignoring the sink changes
+    the target distribution. Process at most 16 queries at once, retaining the
+    sink in the softmax denominator with zero value. This path needs NPU
+    performance validation and is not a replacement for a sink-capable kernel.
+    """
+    indices = indices.reshape(indices.shape[0], -1)
+    ends = torch.as_tensor(query_ends, device=query.device, dtype=torch.long)
+    lengths = torch.as_tensor(seq_lens, device=query.device, dtype=torch.long)
+    starts = torch.cat((ends.new_zeros(1), ends[:-1]))
+    output = torch.empty_like(query)
+    for start in range(0, query.shape[0], 16):
+        stop = min(start + 16, query.shape[0])
+        rows = torch.arange(start, stop, device=query.device)
+        requests = torch.searchsorted(ends, rows, right=True).clamp_max(ends.numel() - 1)
+        positions = lengths[requests] - (ends[requests] - starts[requests]) + rows - starts[requests]
+        selected = indices[start:stop].long()
+        valid = (selected >= 0) & (selected <= positions[:, None]) & (rows[:, None] < ends[-1])
+        selected = selected.masked_fill(~valid, -1)
+        context = gather_context(HYTargetLayerState(-1, cache, table[requests], selected, rope_cache), selected)
+        rank = query.shape[-1]
+        latent, rope = context.kv[..., :rank], context.kv[..., rank:]
+        scores = torch.einsum("thr,tkr->thk", query[start:stop].float(), latent.float())
+        scores += torch.einsum("thd,tkd->thk", query_rope[start:stop].float(), rope.float())
+        scores = (scores * scale).masked_fill(~context.valid[:, None], float("-inf"))
+        sink_logits = sinks.float()[None, :, None].expand(stop - start, -1, 1)
+        probabilities = torch.cat((scores, sink_logits), dim=-1).softmax(dim=-1)[..., :-1]
+        output[start:stop] = torch.einsum("thk,tkr->thr", probabilities, latent.float()).to(query.dtype)
+    return output
 
 
 class HYDflashAttention(nn.Module):
@@ -193,5 +254,6 @@ class HYDflashAttention(nn.Module):
     def forward(self, hidden: torch.Tensor, positions: torch.Tensor, context: HYContext) -> torch.Tensor:
         q_nope, q_rope, latent, k_rope = self.project(hidden)
         q_rope, k_rope = self.rotary(positions, q_rope, k_rope)
-        output = absorbed_mla(q_nope, q_rope, latent, k_rope, context, self.key_up, self.value_up, self.scale)
+        sinks = getattr(getattr(self, "source_attention", None), "learnable_sink_param", None)
+        output = absorbed_mla(q_nope, q_rope, latent, k_rope, context, self.key_up, self.value_up, self.scale, sinks)
         return self.finish(hidden, output)

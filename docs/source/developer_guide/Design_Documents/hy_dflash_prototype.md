@@ -1,298 +1,173 @@
-# HY4 DFlash KV-share draft prototype
+# HY4 BF16 DFlash on vLLM-Ascend 0.20.2
 
-## Status and scope
+This is an **experimental source adapter** for `releases/v0.20.2rc`: a 78-layer
+HY4 MXFP8 target and a separate five-layer BF16 `hy4dflymodels` draft.
+Real checkpoint loading, distributed NPU execution, acceptance rates and
+performance have **not** been validated.
 
-Experimental, opt-in adaptation for vLLM 0.20.2 and Ascend
-`releases/v0.20.2rc`. This revision replaces the earlier three-layer,
-projected-context/MoE/path-selector sketch with the supplied **five-layer dense
-KV-share** architecture.
+The target includes gated MLA, full/shared indexer scheduling, iHC, public
+checkpoint mapping and retained per-layer indexer results. It extends the
+existing fork implementation and the public HY4 architecture, not the
+unreleased source of the official `hy4-a3` container. The
+[upstream HY4 guide](https://github.com/vllm-project/vllm-ascend/blob/bf074627d11b65dfb41720355ba2c08725c0e0d1/docs/source/tutorials/models/Hy4-preview.md)
+states that its image implementation has not yet merged into main.
 
-The patch implements a PyTorch eager attention correctness path, draft module
-composition, and proposer orchestration. It does **not** register a speculative
-checkpoint architecture or guess checkpoint tensor names. An existing HY4 target
-and vendor draft loader must implement the integration bridge below. Having
-ordinary HY4 target inference working is not, by itself, sufficient to provide
-that bridge.
+## Checkpoint contract
 
-No checkpoint loading, NPU execution, acceptance-rate benchmark, ACL graph, or
-distributed execution has been validated. Keep the PR in draft until those
-integration checks pass.
+The latest checkpoint description supersedes the earlier design: keep slot-0
+MTP fusion, but use **no Markov/hidden-correction head and no confidence head**.
+`mtp_fusion_init=random` describes training initialization; inference requires
+trained fusion norms, projection and channel gate. Never initialize them anew.
 
-## Architecture
-
-The values below describe the supplied checkpoint, not runtime constants.
-Layer mapping and context selection come from the draft HF configuration;
-block length is `num_speculative_tokens + 1`, and the mask token is read by
-the existing DFlash parent. Hidden size comes from the loaded model.
-
-| Component | Required behavior |
-| --- | --- |
-| Backbone | Five dense layers; hidden 6144; SwiGLU 6144 → 18432 → 6144 |
-| Target KV sources | Draft layers 0–4 read target layers 61, 65, 69, 73, 77 |
-| Context | Existing target latent KV, read-only; no context projection |
-| DSA selection | Each target layer's indexer at anchor−1, top-2048 ∪ previous 8 |
-| Query block | Anchor + seven mask embeddings; mask token ID 120009 |
-| Attention | HY4 gated MLA; 3-D M-RoPE; causal within each isolated block |
-| Fusion | Per-channel gated MTP fusion, slot 0 only |
-| Correction | Residual SwiGLU on hidden + previous-token embedding |
-| Output | Target LM head, seven sequential correction/argmax steps |
-| Confidence | Linear(6144, 1), including bias, on corrected hidden |
-
-There is no MoE, IHC merge, path selector, or causal convolution in this variant.
-The draft does not run its own context indexer. It consumes the five target
-indexers' selections, independently, at the correct accepted boundary.
-
-### Execution sequence
-
-1. Target forward and verification establish the accepted prefix and anchor.
-2. For each source layer, retrieve its anchor−1 indexer row and read selected KV.
-3. Construct eight embeddings and add MTP fusion only to slot 0.
-4. Run the five-layer backbone once, using each layer's selected target KV plus
-   its own current-block KV.
-5. Apply final RMSNorm.
-6. For slots 1 through 7, run correction, target LM head, argmax and confidence.
-   Feed the actual sampled token as the next correction's previous token.
-7. Target verification remains authoritative.
-
-For the first predicted token, the previous token is the anchor. Slot 0 does not
-produce a draft output. The backbone's mask inputs do not change during the
-seven correction steps.
-
-## Read-only context and dual-source MLA
-
-`vllm_ascend/attention/hy_dflash.py` contains the actual selection, paged-cache
-gather, absorbed MLA math and attention composition.
-
-Logical token offsets are separate from M-RoPE coordinates. Context candidates
-are filtered to the same document and strictly before the anchor, sorted and
-deduplicated. Documents with at most 2048 visible context tokens explicitly use
-their entire prefix. The gather capacity is `context_topk + context_local_window` (2056 here),
-with invalid entries masked; the current block's eight keys are separate and never sparsified.
-
-For each layer:
-
-- The eight queries share one context selection.
-- Context keys already contain the target's rotated RoPE component. Do not
-  rotate them again.
-- Draft Q and current-block K receive the supplied 3-D M-RoPE positions.
-- Current-block latent KV comes from that draft layer's own normalized
-  `kv_a` output.
-- Selected context and causal block keys participate in **one joint softmax**.
-  Adding two independently normalized attention outputs is not equivalent.
-- Request batches do not attend to one another, and draft block KV is transient:
-  it is not committed as future target context.
-
-The correctness kernel absorbs bias-free `kv_b` key expansion into Q and value
-expansion after softmax accumulation. It avoids expanding all context into
-per-head K/V. Scores and accumulation use FP32; output returns to query dtype.
-
-The bridge must provide expansion weights compatible with the checkpoint's
-shared latent basis for both sources. Equal dimensions alone do not prove
-compatibility. Source-specific expansion, biased expansion, quantized packed
-projections, or a different target cache layout require an explicit adaptation;
-they must not be silently reinterpreted.
-
-`HYDflashAttention` composes three already-loaded vendor modules:
-
-- `project(hidden[B,8,H])` returns Q-nope, Q-rope, normalized block latent,
-  and block K-rope.
-- `rotary(positions[3,B,8], q_rope, k_rope)` returns rotated Q/K components.
-  This wrapper preserves HY4's actual rotary section layout and scaling.
-- `finish(hidden, output[B,8,heads,value_dim])` applies HY4's actual output
-  gate and output projection in the trained order.
-
-The gate activation, projection layout and rotary implementation are not
-invented here. Tiny test modules demonstrate this contract, not the vendor's
-checkpoint format. No fused Ascend MLA/DSA operator is claimed by this path.
-
-## Loaded draft composition
-
-`vllm_ascend/patch/worker/hy_dflash.py` adds composition modules without global
-monkey-patching or a new model registration:
-
-- `HYMTPFusion`: `E(anchor) + gate * eh_proj(norm(E(anchor)) || norm(h))`,
-  where `h` is already target-final-normalized hidden at anchor−1.
-- `HYDenseDraftLayer`: attention residual followed by dense MLP residual.
-  Norm/MLP modules receive flattened token rows.
-- `HYHiddenCorrection`: `h + down(silu(gate(z)) * up(z))`, with
-  `z = norm(h) || norm(E(previous_token))`.
-- `HYDflashAdapter`: loaded layers, final norm, correction, LM-head callback
-  and independent confidence head. Pass `hidden_size` and `target_layer_ids`
-  from the model configuration; the loader checks their alignment once.
-
-Pass loaded checkpoint modules and weights to these constructors. Do not
-randomly initialize fusion/correction/confidence for inference: “random
-initialization” describes their training initialization, not serving behavior.
-The expected trained widths are 12288 → 6144 for fusion and
-12288 → 6144 → 6144 for correction. The target final norm must not be applied a
-second time by the provider; fusion's own hidden norm is an additional,
-intentional normalization.
-
-The vendor wrapper's `to_hy_dflash_adapter(target_model)` returns the composed
-adapter, or the vendor loader can return an adapter directly. It is responsible
-for embedding-sharing policy and for a `compute_logits` callback backed by the
-target LM head with full-vocabulary logits. Projection wrappers and expansion
-weight views must be constructed after weights have been loaded and transformed.
-
-Loading this wrapper must not register new persistent draft attention/indexer
-cache layers. Current-block KV stays inside the attention forward.
-
-## Target integration bridge
-
-The target exposes two read-only methods:
-
-```python
-get_hy_dflash_layer_names(layer_ids)
-
-get_hy_dflash_context(
-    *,
-    request_ids,
-    anchor_positions,
-    layer_ids,
-    block_size,
-) -> HYTargetState
-```
-
-These are required new integration contracts, not existing upstream HY4 APIs.
-No target architecture is changed by this patch. The existing target adaptation
-must export its state through these methods.
-
-`HYTargetState` contains:
-
-- Five `HYTargetLayerState` objects in the requested layer order. Each includes
-  `layer_id`, floating-point paged `cache[physical_blocks, block_size, R+Dr]`,
-  request-ordered `block_table[B,max_blocks]`, and logical
-  `topk_indices[B,<=2048]`.
-- `document_starts[B]`, in sequence-token coordinates.
-- `final_hidden[B,6144]`: target final-norm output at anchor−1.
-- `query_positions[3,B,8]`: correct M-RoPE positions including multimodal deltas.
-
-The cache's first R channels are normalized latent KV; its final Dr channels
-are already-rotated key positions. A vendor-specific view/dequantization is
-needed if the actual NPU cache uses another layout. The gather fails on a
-selected token pointing to an unallocated block, rather than dropping context.
-
-The provider must retain each layer's indexer results for the target forward
-rows until verification determines anchor−1. A single shared scratch top-k
-buffer overwritten by later layers is insufficient. Likewise, selecting the
-last scheduled row instead of the last accepted row leaks rejected future
-tokens. Resolve rows using request identity and logical position, including
-batch reordering, chunked prefill, rejection and accepted-prefix compaction.
-Read references only when target work producing them has completed on the
-relevant stream.
-
-The supplied path is intentionally not required to develop/test this boundary.
-Actual checkpoint names, physical cache layout and retained indexer-row access
-remain vendor integration work.
-
-## Proposer responsibilities
-
-`AscendHYDflashProposer` still inherits `AscendDflashProposer`, but replaces
-ordinary DFlash's projected-context execution.
-
-| Method | Responsibility in this variant |
-| --- | --- |
-| `load_model` | Load vendor draft, compose adapter, identify five target source layers |
-| `initialize_attn_backend` | Bind target KV groups; no new draft context cache |
-| `set_inputs_first_pass` | Build anchor/mask blocks and accepted logical boundaries |
-| `prepare_context` | Read target state; select, deduplicate and gather each layer's KV |
-| `build_model_inputs_first_pass` | Pass blocks, 3-D positions, final hidden and five contexts |
-| `_propose` | Enter eager draft context, bypass shared single-layer metadata builder |
-| `_run_merged_draft` | Run backbone once, then seven sequential correction/head steps |
-| `commit_draft_probs` | Publish greedy proposals with delta q; no unused random-q argument |
-| `verification_probs` | Return actual draft q only; never confidence |
-| `dummy_run` | Profile draft math with masked contexts and no live target cache access |
-
-`initialize_attn_backend` does not replace `set_inputs_first_pass`: one binds
-cache groups at initialization; the other prepares the current batch every
-round.
-
-There is no `prefill_context` projection/cache-write stage. Ordinary DFlash's
-`_context_slot_mapping_buffer` is removed. The only slot mapping here is the
-query metadata's all-minus-one placeholder; actual block KV is transient.
-Logical context indices are translated through each target layer's block table
-solely to **read** existing cache slots.
-
-The unmodified shared proposer still handles its existing input preparation.
-HY's first pass uses rejection-adjusted `seq_lens`, not a M-RoPE axis, to derive
-the anchor. Its private `_propose` avoids routing HY through Qwen DFlash's
-`combine_hidden_states` or generic per-layer attention metadata assumptions.
-
-### Confidence and sampling
-
-The confidence output is an acceptance logit; sigmoid is a learned estimate
-of distribution overlap, not a measured overlap and not the actual rejection
-ratio. `confidence_logits[B,7]` is diagnostic, associated with
-`confidence_request_ids`. It never modifies hidden states, logits, draft
-length, or target verification.
-
-This implementation uses deterministic argmax proposals, as the existing base
-path does. Therefore draft q is a delta distribution and
-`verification_probs()` returns `None` to the existing rejection sampler.
-It must not return a softmax distribution after generating tokens with argmax.
-The runner continues passing its original target logits to verification.
-Random proposal sampling and request-aligned storage of its actual q are not
-implemented.
-
-## Opt-in and limitations
-
-The loaded draft HF configuration opts in explicitly:
+Keep the complete checkpoint config. These are relevant fields, not a
+replacement for its attention dimensions, rotary parameters or other fields:
 
 ```json
 {
-  "dflash_config": {
-    "ascend_proposer": "hy",
-    "mask_token_id": 120009,
-    "target_layer_ids": [61, 65, 69, 73, 77],
-    "context_topk": 2048,
-    "context_local_window": 8
-  }
+  "architectures": ["hy4dflymodels"],
+  "model_type": "dflash",
+  "torch_dtype": "bfloat16",
+  "num_hidden_layers": 5,
+  "hidden_size": 6144,
+  "intermediate_size": 18432,
+  "target_layer_ids": [60, 64, 68, 72, 76],
+  "target_kv_layers": [61, 65, 69, 73, 77],
+  "target_index_layers": [61, 65, 69, 73, 77],
+  "target_init_attn_layers": [61, 65, 69, 73, 77],
+  "context_local_window": 8,
+  "dflash_causal_attn": true,
+  "mtp_fusion_slot0": true,
+  "dflash_config": {"mask_token_id": 120009, "context_topk": 2048}
 }
 ```
 
-For this checkpoint use speculative method `dflash`, parallel drafting, seven
-speculative tokens, and speculative `enforce_eager=true`. This is a configuration fragment,
-not a complete model configuration or a standalone serving command.
-The context fields shown are required bridge configuration, not assumed vendor
-checkpoint field names. A vendor loader should map its native metadata to these
-fields. Alternate checkpoints may supply different layer counts, masks and
-block lengths; changing a serving flag does not retrain a fixed-block checkpoint.
+`HY4DflyModels` and the `DFlash`-prefixed names generated by vLLM 0.20.2's EAGLE
+config wrapper are registered too. The model plugin registers the missing HF
+config and target MLA converter. Other DFlash architectures retain their path.
 
-Internal tensor shapes are handled by their tensor operations rather than
-repeated Python type/shape checks. Remaining explicit checks are at meaningful
-boundaries: context configuration, loaded layer mapping, returned layer order,
-floating-point cache format and allocated cache addresses. Unsupported execution
-capabilities are reported together once at initialization.
+All layer lists use **literal zero-based checkpoint indices**. No implicit
+subtraction is applied. `target_layer_ids` remains checkpoint metadata and does
+not select the live cache in this variant. KV and indexer source lists are
+independent. `target_init_attn_layers` records training initialization: serving
+loads trained draft attention, not copies of the target MXFP8 tensors.
+The public full-indexer schedule is layer 0, then 1, 5, 9, ..., 77.
 
-TP, DP, PP, PCP and DCP must all be 1; draft TP must be 1. LoRA and separate
-LM-head TP are rejected. Other DFlash models remain on their original path.
+## Execution and DSpark reference
 
-The reference gather has one allocation-validity host synchronization per source
-layer; it is documented and deliberately outside attention forward. It still
-affects latency. Gather allocations, FP32 reference attention, seven LM-head
-calls and confidence computation need NPU profiling before performance claims.
-Distributed collective semantics, graph-safe metadata and optimized Ascend
-sparse kernels are separate follow-up work.
+1. Take the target's final-normalized hidden state at `anchor - 1` and its newly
+   produced anchor token.
+2. For each draft layer, read target latent KV and already-rotated RoPE keys.
+   Select top-2048 at `anchor - 1`, union the preceding eight same-document
+   positions, deduplicate and exclude rejected/future rows. Contexts of length
+   at most 2048 use the complete visible prefix.
+3. Build `[anchor, mask, mask, mask, mask, mask, mask, mask]`. Fuse only slot 0
+   using the trained MTP norms, projection and channel gate.
+4. Run five dense gated-MLA/SwiGLU layers once. Attention has one softmax over
+   each layer's target context plus its causal current-block KV. Draft tokens
+   never write target KV or allocate persistent draft context/indexer caches.
+5. Apply draft final RMSNorm and project slots 1 through 7 together through the
+   target LM head, or the draft's own head if the checkpoint supplies one.
+   Argmax proposals have a delta distribution, represented by `draft_probs=None`
+   in the existing rejection sampler.
+
+All three M-RoPE axes are preserved. Distinct axes require checkpoint
+`mrope_section`, given as three interleaved rotary-pair counts. Equal text
+positions can use ordinary RoPE. Missing sections for distinct axes raise.
+
+Compacted hidden states and original indexer buffers use different row spaces.
+The proposer retains `prepare_inputs`' original row map for indexer reads;
+hidden states use compacted rows. Both padded and compacted batches need NPU
+validation.
+
+[Main's DSpark implementation](https://github.com/vllm-project/vllm-ascend/blob/bf074627d11b65dfb41720355ba2c08725c0e0d1/vllm_ascend/models/deepseek_v41/dspark.py)
+is the orchestration reference: one block forward, separate loading and explicit
+context preparation. Its `main_proj`, context `wkv`, SWA writer, Markov head and
+confidence head are not applicable to this direct target-KV-sharing checkpoint.
+
+## Strict weight loading
+
+The private checkpoint's exact tensor names/shapes were unavailable during
+implementation. The wrapper implements this **canonical mapping**:
+
+| Component | Keys |
+| --- | --- |
+| Layer norms | `model.layers.{0..4}.input_layernorm.weight`, `post_attention_layernorm.weight` |
+| MLA under each layer | `self_attn.q_a_proj.weight`, `q_a_layernorm.weight`, `q_b_proj.weight`, `kv_a_proj_with_mqa.weight`, `kv_a_layernorm.weight`, `kv_b_proj.weight`, `o_proj.weight`, `linear_gate.weight` |
+| SwiGLU under each layer | `mlp.gate_proj.weight`, `up_proj.weight`, `down_proj.weight` |
+| Slot-0 fusion | `model.fusion.embedding_norm.weight`, `hidden_norm.weight`, `eh_proj.weight`, `gate` |
+| Final norm | `model.norm.weight` |
+| Optional own embedding/head | `model.embed_tokens.weight`, `lm_head.weight` |
+
+Packed `fused_qkv_a_proj` and `gate_up_proj` tensors are also accepted. Unprefixed
+keys receive `model.`. Draft indexer weights and rotary frequency buffers are
+explicitly unused. Other unknown keys, missing trained parameters or missing
+packed shards raise errors. Embeddings/head are shared only when absent.
+
+Different vendor names require exact entries in
+`dflash_config.weight_name_mapping`, for example
+`{"mtp_fusion.channel_gate": "model.fusion.gate"}`. This is an example, not a
+verified vendor alias. Inspect the checkpoint on its host before mapping:
+
+```bash
+python tools/inspect_hy_dflash_checkpoint.py /models/HY4-draft-bf16 --output /tmp/hy4-manifest.json
+```
+
+The inspector reads JSON and safetensors headers without tensor data or NPU
+dependencies. Match every trained tensor, especially fusion weights, before
+startup. Training layer lists cannot replace missing checkpoint weights.
+
+## First hardware run
+
+The target must have metadata compatible with the existing Ascend MXFP8 loader.
+`--dtype bfloat16` controls activations and default KV dtype; it does not change
+the target's quantized weight storage. The draft loader copies the config,
+sets BF16 and clears its own `quant_config`, leaving the target unchanged.
+
+Example for a suitable eight-device deployment:
+
+```bash
+vllm serve /models/HY4-mxfp8 \
+  --quantization ascend \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
+  --tensor-parallel-size 8 \
+  --enforce-eager \
+  --no-async-scheduling \
+  --max-model-len 4096 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 256 \
+  --speculative-config '{"method":"dflash","model":"/models/HY4-draft-bf16","num_speculative_tokens":7,"draft_tensor_parallel_size":8,"enforce_eager":true,"quantization":null}'
+```
+
+Choose TP for the hardware; draft TP must equal target TP. Both models require
+eager execution, with floating-point target KV, PP/DP/PCP/DCP equal to one,
+no LoRA and no separate LM-head TP. Multimodal target ingestion is outside this
+text-serving adapter's validation.
+
+The target's learned sink uses a chunked PyTorch reference fallback because
+0.20.2 SFA exposes neither a sink argument nor LSE. Target sink attention and
+draft dual-source attention need native kernels for production performance.
+No throughput or acceptance-rate claim is made.
 
 ## Validation
 
-Portable tests:
-
 ```bash
-python -m pytest --noconftest -q tests/ut/spec_decode/test_hy_dflash_proposer.py
+pytest --noconftest tests/ut/spec_decode/test_hy_dflash_proposer.py -q
 ```
 
-The tests execute real selection, gather, absorbed attention, fusion,
-correction and five-layer composition with tiny loaded modules. They include
-an independent expanded-K/V attention reference in FP32/BF16, causal and batch
-isolation, context union/bounds, physical-page lookup, read-only cache, 3-D
-positions, serial predecessor tokens, confidence isolation, factory routing,
-runner verification and unsupported-mode guards. End-to-end tiny-model tests
-also vary layer count/mapping, mask ID, speculative length, top-k and local
-window (including zero), through both live forward and dummy profiling.
+These tests cover numerical attention/context gathering, learned sinks, row
+alignment, M-RoPE, no-head drafting, strict loading and quantization isolation.
+They replace vLLM/NPU infrastructure with CPU primitives and do not prove CANN,
+distributed or real-checkpoint compatibility.
 
-The vLLM/Ascend infrastructure is mocked; the runner sampling method is loaded
-from its source AST. These are not full runner, Triton, HY4 checkpoint or NPU
-integration tests. Before marking ready, validate vendor bridge/weight mapping,
-prefill and rejection/reordering with real target indexers, NPU numerical
-parity, end-to-end generation, memory use and acceptance/throughput.
+On the NPU environment, compare greedy outputs with and without speculation:
+
+```bash
+python tests/e2e/multicard/test_hy_dflash.py --target /models/HY4-mxfp8 --draft /models/HY4-draft-bf16 --tp 8
+```
+
+Add short/long contexts, concurrent
+requests, rejection and TP comparisons. Verify target-alone output against a
+trusted HY4 implementation before interpreting draft acceptance. For incorrect
+draft output, compare selected logical indices, physical KV slots, latent/RoPE
+KV, fusion output and the first divergent layer's attention output.

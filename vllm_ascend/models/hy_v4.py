@@ -52,6 +52,7 @@ from vllm_ascend.models.deepseek_v4 import (
     DeepseekV4MoE,
 )
 from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
+from vllm_ascend.patch.hy4_config import get_hy_dflash_config, is_hy_dflash
 
 _SPARSE_LAYER_TYPES = {
     "sparse_attention",
@@ -63,11 +64,15 @@ _SPARSE_LAYER_TYPES = {
 
 def normalize_hyv4_config(config: PreTrainedConfig) -> PreTrainedConfig:
     """Populate aliases consumed by vLLM 0.20.2 and Ascend shared layers."""
-    config.router_scaling_factor = getattr(config, "router_scaling_factor", config.routed_scaling_factor)
-    config.num_experts = getattr(config, "num_experts", config.n_routed_experts)
-    config.expert_hidden_dim = getattr(config, "expert_hidden_dim", config.moe_intermediate_size)
-    config.num_shared_experts = getattr(config, "num_shared_experts", config.n_shared_experts)
-    config.route_norm = getattr(config, "route_norm", config.norm_topk_prob)
+    for destination, source in (
+        ("router_scaling_factor", "routed_scaling_factor"),
+        ("num_experts", "n_routed_experts"),
+        ("expert_hidden_dim", "moe_intermediate_size"),
+        ("num_shared_experts", "n_shared_experts"),
+        ("route_norm", "norm_topk_prob"),
+    ):
+        if not hasattr(config, destination):
+            setattr(config, destination, getattr(config, source))
     config.num_hash_layers = getattr(config, "num_hash_layers", 0)
     config.scoring_func = getattr(config, "scoring_func", "sigmoid")
     config.n_group = getattr(config, "n_group", 1)
@@ -217,6 +222,7 @@ class HYV4MLAAttention(nn.Module):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None,
         topk_capture_buffer: torch.Tensor | None = None,
+        draft_only: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -271,16 +277,18 @@ class HYV4MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        rope_parameters = dict(config.rope_parameters)
+        rope_parameters.pop("mrope_section", None)
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_parameters=config.rope_parameters,
+            rope_parameters=rope_parameters,
             is_neox_style=False,
         )
 
         self.indexer = None
         self.indexer_rope_emb = None
-        if self.is_sparse and not self.skip_topk:
+        if self.is_sparse and not self.skip_topk and not draft_only:
             self.indexer_rope_emb = get_rope(
                 self.qk_rope_head_dim,
                 max_position=getattr(config, "max_position_embeddings", 8192),
@@ -317,6 +325,11 @@ class HYV4MLAAttention(nn.Module):
             if getattr(config, "learnable_sink", False)
             else None
         )
+
+        if draft_only:
+            # Draft context uses the target's retained indexer selection. Its
+            # current block has transient dense causal KV, never paged KV.
+            return
 
         modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -373,14 +386,16 @@ class HYV4MLAAttention(nn.Module):
         )
 
     def draft_rotary(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
-        if positions.ndim == 3:
-            positions = positions[0]
-        positions = positions.reshape(-1)
+        from vllm_ascend.attention.hy_dflash import apply_hy_rotary
+
         q_shape, k_shape = query.shape, key.shape
-        q, k = self.rotary_emb(
+        rope = self.config.rope_parameters
+        q, k = apply_hy_rotary(
+            self.rotary_emb,
             positions,
             query.reshape(-1, self.num_local_heads, self.qk_rope_head_dim),
             key.reshape(-1, 1, self.qk_rope_head_dim),
+            sections=rope.get("mrope_section"),
         )
         return q.view(q_shape), k.view(k_shape)
 
@@ -398,7 +413,7 @@ class HYV4MLAAttention(nn.Module):
         return result.view(*hidden_states.shape[:-1], self.hidden_size)
 
     def draft_kv_up_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        impl = self.mla_attn.mla_attn.impl
+        impl = self.mla_attn.mla_attn.impl if hasattr(self, "mla_attn") else None
         if hasattr(impl, "W_UK_T") and hasattr(impl, "W_UV"):
             return impl.W_UK_T, impl.W_UV.transpose(-1, -2)
         weight = self.kv_b_proj.weight.view(
@@ -490,14 +505,17 @@ class HYV4Model(nn.Module):
                 device=self.device,
             )
 
-        dflash_config = {}
         speculative = vllm_config.speculative_config
+        capture_layer_ids = ()
         if speculative is not None and speculative.draft_model_config is not None:
-            dflash_config = getattr(speculative.draft_model_config.hf_config, "dflash_config", {}) or {}
-        capture_layer_ids = tuple(dflash_config.get("target_layer_ids", ()))
+            draft_config = speculative.draft_model_config.hf_config
+            if is_hy_dflash(draft_config):
+                capture_layer_ids = tuple(get_hy_dflash_config(draft_config)["target_index_layers"])
         self.hy_dflash_topk_buffers: dict[int, torch.Tensor] = {}
         if self.topk_indices_buffer is not None:
             for layer_id in capture_layer_ids:
+                if not 0 <= layer_id < config.num_hidden_layers:
+                    raise ValueError(f"HY target indexer layer {layer_id} is outside the backbone")
                 buffer = torch.empty_like(self.topk_indices_buffer)
                 self.register_buffer(f"hy_dflash_topk_{layer_id}", buffer, persistent=False)
                 self.hy_dflash_topk_buffers[layer_id] = buffer
@@ -591,6 +609,7 @@ class AscendHYV4ForCausalLM(
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.num_moe_layers = sum(kind != "dense" for kind in self.config.mlp_layer_types)
         self.set_moe_parameters()
 
     def set_moe_parameters(self):
@@ -659,6 +678,10 @@ class AscendHYV4ForCausalLM(
         if not gate_up and not down:
             return False
         layer_prefix = name.split(".experts.", 1)[0]
+        projection = "gate_up_proj" if gate_up else "down_proj"
+        suffix = name.split(f".experts.{projection}", 1)[1].lstrip(".") or "weight"
+        if suffix not in ("weight", "weight_scale"):
+            raise ValueError(f"Unsupported fused HY4 expert tensor: {name}")
         for param_name, weight_name, expert_id, shard_id in expert_mapping:
             if gate_up and shard_id not in ("w1", "w3"):
                 continue
@@ -668,7 +691,7 @@ class AscendHYV4ForCausalLM(
             expert_weight = weight[logical_id]
             if gate_up:
                 expert_weight = expert_weight.chunk(2, dim=-2)[0 if shard_id == "w1" else 1]
-            candidate = f"{layer_prefix}.{param_name}weight"
+            candidate = f"{layer_prefix}.{param_name}{suffix}"
             if candidate not in params:
                 continue
             param = params[candidate]

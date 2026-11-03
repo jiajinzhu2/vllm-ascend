@@ -21,19 +21,23 @@ from vllm_ascend.attention.hy_dflash import (
     gather_context,
     select_context_indices,
 )
+from vllm_ascend.patch.hy4_config import get_hy_dflash_config
 from vllm_ascend.patch.worker.hy_dflash import HYDflashAdapter
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.utils import lmhead_tp_enable
 
 
 class AscendHYDflashProposer(AscendDflashProposer):
-    """Eager KV-share backbone followed by serial hidden correction."""
+    """Eager KV-share backbone with optional checkpoint-supplied output heads."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
+        hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+        hf_config.dflash_config = get_hy_dflash_config(hf_config)
         self._validate_config(vllm_config)
         super().__init__(vllm_config, device, runner=runner)
         config = self.speculative_config.draft_model_config.hf_config.dflash_config
-        self.target_layer_ids = tuple(config["target_layer_ids"])
+        self.target_layer_ids = tuple(config["target_kv_layers"])
+        self.target_index_layers = tuple(config["target_index_layers"])
         self.context_topk = config["context_topk"]
         self.context_local_window = config["context_local_window"]
         self.query_block_size = self.num_speculative_tokens + 1
@@ -55,16 +59,17 @@ class AscendHYDflashProposer(AscendDflashProposer):
         self.confidence_logits = None
         self.confidence_request_ids: tuple[str, ...] = ()
         self._target_model = None
+        self._target_row_indices = None
 
     @staticmethod
     def _validate_config(vllm_config: VllmConfig) -> None:
-        # This implementation has no graph/distributed/LoRA execution path yet.
+        # Matched TP uses the native sharded projections; other distributed
+        # layouts and graphs need additional cache/row-mapping integration.
         # Check capabilities once; model dimensions belong to the checkpoint.
         spec = vllm_config.speculative_config
         unsupported = [
             name
             for name in (
-                "tensor_parallel_size",
                 "pipeline_parallel_size",
                 "data_parallel_size",
                 "prefill_context_parallel_size",
@@ -76,7 +81,10 @@ class AscendHYDflashProposer(AscendDflashProposer):
             name
             for name, enabled in (
                 ("ACL graphs", not spec.enforce_eager),
-                ("draft TP", spec.draft_tensor_parallel_size != 1),
+                (
+                    "draft TP must equal target TP",
+                    spec.draft_tensor_parallel_size != getattr(vllm_config.parallel_config, "tensor_parallel_size", 1),
+                ),
                 ("LoRA", vllm_config.lora_config is not None),
                 ("LM-head TP", lmhead_tp_enable()),
             )
@@ -84,6 +92,45 @@ class AscendHYDflashProposer(AscendDflashProposer):
         ]
         if unsupported:
             raise NotImplementedError("HY eager KV-share does not implement: " + ", ".join(unsupported))
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is not None and not model_config.enforce_eager:
+            raise NotImplementedError("HY target sink fallback and indexer capture require target enforce_eager")
+        if model_config is not None and model_config.dtype != torch.bfloat16:
+            raise ValueError("HY BF16 draft sharing target embeddings requires --dtype bfloat16")
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is not None and cache_config.cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError("HY KV sharing requires floating-point target KV; use BF16 dtype and cache dtype auto")
+
+    def _raise_if_mrope(self):
+        # This proposer carries all three axes through the draft attention.
+        pass
+
+    def _get_model(self):
+        # vLLM 0.20.2's common loader can otherwise retain the target quant_config
+        # when a different model_config is supplied. Never quantize this BF16
+        # checkpoint with the target's MXFP8 scheme.
+        from vllm.compilation.backends import set_model_tag
+        from vllm.model_executor.model_loader import get_model
+
+        config = copy(self.vllm_config)
+        config.model_config = copy(self.speculative_config.draft_model_config)
+        if config.model_config.quantization is not None:
+            raise ValueError("HY4DflyModels requires an unquantized BF16 draft checkpoint")
+        config.model_config.dtype = torch.bfloat16
+        config.quant_config = None
+        config.parallel_config = self.speculative_config.draft_parallel_config
+        with set_model_tag("eagle_head"):
+            return get_model(vllm_config=config)
+
+    def prepare_inputs(self, *args, **kwargs):
+        metadata, rows = super().prepare_inputs(*args, **kwargs)
+        self._target_row_indices = rows
+        return metadata, rows
+
+    def prepare_inputs_padded(self, *args, **kwargs):
+        result = super().prepare_inputs_padded(*args, **kwargs)
+        self._target_row_indices = result[1]
+        return result
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         # Fusion consumes target final-norm hidden at anchor-1, not EAGLE aux
@@ -91,11 +138,11 @@ class AscendHYDflashProposer(AscendDflashProposer):
         return False
 
     def load_model(self, model: torch.nn.Module) -> None:
-        """Load through vLLM, then compose the vendor's already-loaded modules.
+        """Load the BF16 checkpoint, then compose its loaded modules.
 
         No draft persistent context cache is discovered/allocated by this path.
-        A vendor wrapper can return HYDflashAdapter directly or implement
-        to_hy_dflash_adapter(target_model). This is not a checkpoint-name guess.
+        HY4DflyModels implements to_hy_dflash_adapter(target_model). External
+        wrappers can supply the same bridge without changing this proposer.
         """
         self._target_model = model
         with self.maybe_eager_context:
@@ -139,7 +186,10 @@ class AscendHYDflashProposer(AscendDflashProposer):
         batch = anchor_positions.shape[0]
         rows = token_indices_to_sample[:batch].long()
         layers = []
-        for layer_id, group_id in zip(self.target_layer_ids, self.target_kv_cache_group_ids, strict=True):
+        source_rows = rows if self._target_row_indices is None else self._target_row_indices[rows].long()
+        for layer_id, index_layer_id, group_id in zip(
+            self.target_layer_ids, self.target_index_layers, self.target_kv_cache_group_ids, strict=True
+        ):
             attention = self._target_model.get_hy_dflash_attention(layer_id)
             pages = attention.mla_attn.mla_attn.kv_cache
             layers.append(
@@ -148,7 +198,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
                     cache=pages[0],
                     rope_cache=pages[1],
                     block_table=self.runner.input_batch.block_table[group_id].get_device_tensor()[:batch],
-                    topk_indices=self._target_model.get_hy_dflash_topk_buffer(layer_id)[rows],
+                    topk_indices=self._target_model.get_hy_dflash_topk_buffer(index_layer_id)[source_rows],
                 )
             )
 
@@ -234,20 +284,23 @@ class AscendHYDflashProposer(AscendDflashProposer):
         original forward row, even after compacted/padded verification batches.
         """
         batch = cad.num_reqs
-        accepted_lengths = cad.seq_lens
+        accepted_lengths = cad.seq_lens[:batch]
         if num_rejected_tokens_gpu is not None:
             accepted_lengths = accepted_lengths - num_rejected_tokens_gpu.reshape(batch)
         num_tokens = batch * self.query_block_size
         self.input_ids[:num_tokens].fill_(self.parallel_drafting_token_id)
         self.input_ids[: num_tokens : self.query_block_size].copy_(next_token_ids.reshape(batch))
         if token_indices_to_sample is None:
-            token_indices_to_sample = cad.query_start_loc[1:] - 1
+            token_indices_to_sample = cad.query_start_loc[1 : batch + 1] - 1
+            if num_rejected_tokens_gpu is not None:
+                token_indices_to_sample = token_indices_to_sample - num_rejected_tokens_gpu.reshape(batch)
         self.prepare_context(
             accepted_lengths,
             target_positions,
             target_hidden_states,
             token_indices_to_sample,
         )
+        self._target_row_indices = None
         indices = torch.arange(num_tokens, device=self.device, dtype=torch.int32).view(batch, self.query_block_size)[
             :, 1:
         ]
@@ -337,15 +390,24 @@ class AscendHYDflashProposer(AscendDflashProposer):
         is_prefill=None,
     ) -> torch.Tensor:
         hidden = self.model(**self.build_model_inputs_first_pass(num_tokens))
+        if self.model.correction is None:
+            # This checkpoint has no Markov/correction or confidence head.
+            # One backbone pass and one batched head projection produce all
+            # seven proposals. Never manufacture untrained output heads.
+            sample_hidden = hidden[:, 1:].reshape(-1, self.hidden_size)
+            logits = self.model.compute_logits(sample_hidden)
+            self.confidence_logits = None
+            return self.commit_draft_probs(logits.argmax(dim=-1).view(batch_size, -1))
         ids = torch.empty((batch_size, self.query_block_size - 1), dtype=torch.int64, device=self.device)
-        confidence = torch.empty_like(ids, dtype=torch.float32)
+        confidence = torch.empty_like(ids, dtype=torch.float32) if self.model.confidence_head is not None else None
         previous_ids = self.input_ids[: num_tokens : self.query_block_size].long()
         for step in range(self.query_block_size - 1):
             corrected = self.model.correct_hidden_states(hidden[:, step + 1], previous_ids)
             logits = self.model.compute_logits(corrected)
             ids[:, step] = logits.argmax(dim=-1)
             # This is a diagnostic prediction, not p/q, not a path selector.
-            confidence[:, step] = self.model.predict_confidence(corrected).float()
+            if confidence is not None:
+                confidence[:, step] = self.model.predict_confidence(corrected).float()
             previous_ids = ids[:, step]
         self.confidence_logits = confidence
         return self.commit_draft_probs(ids)
@@ -372,7 +434,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
         **kwargs,
     ) -> None:
         if num_reqs == 0:
-            return
+            num_reqs = min(self.max_batch_size, max(1, num_tokens // self.query_block_size))
         # No live target read/write and no context projection. Allocate worst-case
         # gathered context for memory profiling, even though all entries are masked.
         self._contexts = self.model.dummy_contexts(num_reqs, self.context_topk + self.context_local_window)

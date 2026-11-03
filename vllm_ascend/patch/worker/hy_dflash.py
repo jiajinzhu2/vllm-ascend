@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-"""Composition adapter for an already-loaded HY DFlash draft, not a new loader.
-
-No global patch or fictitious checkpoint architecture is registered. The vendor
-draft wrapper supplies loaded modules via to_hy_dflash_adapter(target_model).
-"""
+"""Composition of loaded HY DFlash modules and read-only target KV attention."""
 
 from collections.abc import Callable, Sequence
 
@@ -82,13 +78,13 @@ class HYDenseDraftLayer(nn.Module):
 
 
 class HYDflashAdapter(nn.Module):
-    """Loaded dense layers, slot-0 fusion, correction and confidence.
+    """Loaded dense layers and slot-0 fusion, with optional auxiliary heads.
 
     The target supplies embeddings/LM head through the checkpoint's normal
     sharing policy. final_hidden is already target-final-normalized. The fusion
     hidden_norm is the *additional* normalization in the specified MTP formula.
-    Checkpoint names and the concrete HY4 projection/rotary/finish wrappers must
-    come from the existing model implementation, not guesses in this adapter.
+    HY4DflyModels uses neither correction nor confidence. The optional modules
+    preserve the separate adapter contract for checkpoints that contain them.
     """
 
     hy_dflash_contract_version = 2
@@ -115,8 +111,8 @@ class HYDflashAdapter(nn.Module):
         embed_tokens: nn.Module,
         final_norm: nn.Module,
         fusion: HYMTPFusion,
-        correction: HYHiddenCorrection,
-        confidence_head: nn.Module,
+        correction: HYHiddenCorrection | None,
+        confidence_head: nn.Module | None,
         compute_logits: Callable[[torch.Tensor], torch.Tensor],
         hidden_size: int,
         target_layer_ids: Sequence[int],
@@ -145,6 +141,8 @@ class HYDflashAdapter(nn.Module):
         return self.final_norm(hidden.flatten(0, 1)).view(batch, block_size, self.hidden_size)
 
     def correct_hidden_states(self, hidden: torch.Tensor, previous_token_ids: torch.Tensor) -> torch.Tensor:
+        if self.correction is None:
+            return hidden
         return self.correction(hidden, self.embed_tokens(previous_token_ids))
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:

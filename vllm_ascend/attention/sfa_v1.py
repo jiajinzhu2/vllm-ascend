@@ -425,8 +425,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.sinks = kwargs.get("sinks")
         if self.sinks is not None:
             logger.warning_once(
-                "The current Ascend sparse-MLA kernel cannot consume HY4 learnable sinks; "
-                "the parameter is loaded and retained for the sink-capable kernel path."
+                "HY4 learned sinks use the eager PyTorch sparse-MLA correctness path on 0.20.2; "
+                "NPU performance has not been validated."
             )
 
         ascend_config = get_ascend_config()
@@ -1079,6 +1079,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         block_table = attn_metadata.block_table
         kv = kv_cache[0]
         key_rope = kv_cache[1]
+
+        if self.sinks is not None:
+            from vllm_ascend.attention.hy_dflash import sparse_mla_with_sink
+
+            return sparse_mla_with_sink(
+                ql_nope,
+                q_pe,
+                kv,
+                key_rope,
+                topk_indices,
+                block_table,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                self.scale,
+                self.sinks,
+            )
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
