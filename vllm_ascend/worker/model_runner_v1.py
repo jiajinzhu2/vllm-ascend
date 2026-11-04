@@ -132,6 +132,7 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
+from vllm_ascend.spec_decode.hy_dflash_proposer import AscendHYDflashProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
@@ -2331,9 +2332,10 @@ class NPUModelRunner(GPUModelRunner):
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
+        draft_probs = self.drafter.verification_probs() if isinstance(self.drafter, AscendHYDflashProposer) else None
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            draft_probs,
             logits,
             sampling_metadata,
         )
@@ -3458,6 +3460,8 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        if isinstance(self.drafter, AscendHYDflashProposer):
+            self.drafter.reserve_target_kv_scratch(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
@@ -4360,10 +4364,18 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
 
+    def has_draft_only_graphs(self) -> bool:
+        return isinstance(self.drafter, AscendHYDflashProposer) and self.drafter.use_cuda_graph
+
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+            if self.has_draft_only_graphs():
+                # HY's target stays eager, so the upstream dispatcher has no
+                # descriptors. Capture the draft independently on the NPU stream.
+                with self._freeze_gc(), graph_capture(device=self.device):
+                    return self.drafter.capture_model()
             return GPUModelRunner.capture_model(self)
 
     def _prepare_multimodal_fields(self):

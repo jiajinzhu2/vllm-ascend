@@ -80,6 +80,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         skip_topk: bool = False,
+        linear_gate: nn.Module | None = None,
+        gating_type: str | None = None,
+        sinks: torch.Tensor | None = None,
+        topk_capture_buffer: torch.Tensor | None = None,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
@@ -125,6 +129,10 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             kv_a_layernorm=mla_modules.kv_a_layernorm,
             o_proj=mla_modules.o_proj,
             layer_name=f"{prefix}.attn",
+            linear_gate=linear_gate,
+            gating_type=gating_type,
+            sinks=sinks,
+            topk_capture_buffer=topk_capture_buffer,
         )
 
         original_process_weights = self.mla_attn.process_weights_after_loading
