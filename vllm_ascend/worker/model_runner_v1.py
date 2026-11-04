@@ -3460,6 +3460,8 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        if isinstance(self.drafter, AscendHYDflashProposer):
+            self.drafter.reserve_target_kv_scratch(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None

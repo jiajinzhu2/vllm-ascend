@@ -36,6 +36,9 @@ def get_hy_dflash_config(config) -> dict:
         "mask_token_id",
         "dflash_causal_attn",
         "mtp_fusion_slot0",
+        "use_hidden_correction",
+        "use_markov_head",
+        "use_confidence_head",
     ):
         value = getattr(config, key, None)
         if value is not None:
@@ -49,12 +52,26 @@ def get_hy_dflash_config(config) -> dict:
         options.setdefault("mask_token_id", 120009)
         options.setdefault("dflash_causal_attn", True)
         options.setdefault("mtp_fusion_slot0", True)
+        # 1104 checkpoint contract. Older no-head checkpoints must opt out.
+        correction = options.get("use_hidden_correction", options.get("use_markov_head", True))
+        if "use_markov_head" in options and options["use_markov_head"] != correction:
+            raise ValueError("Conflicting HY hidden-correction/Markov flags")
+        options["use_hidden_correction"] = correction
+        options.setdefault("use_confidence_head", True)
+        for name in ("use_hidden_correction", "use_confidence_head"):
+            if type(options[name]) is not bool:
+                raise ValueError(f"HY {name} must be a boolean")
+        if options["use_confidence_head"] and not correction:
+            raise ValueError("HY confidence head requires hidden correction")
     # Legacy adapters used one explicitly supplied source-layer list.
     layers = options.get("target_layer_ids", ())
     options.setdefault("target_kv_layers", layers)
     options.setdefault("target_index_layers", options["target_kv_layers"])
     options.setdefault("target_init_attn_layers", options["target_kv_layers"])
     options.setdefault("ascend_attention_backend", "auto")
+    options.setdefault("ascend_kv_layout", "auto")
+    if options["ascend_kv_layout"] not in ("auto", "paged", "gather"):
+        raise ValueError("HY ascend_kv_layout must be auto, paged or gather")
     if options["ascend_attention_backend"] not in ("auto", "sfa", "reference"):
         raise ValueError("HY ascend_attention_backend must be auto, sfa or reference")
     count = getattr(config, "num_hidden_layers", len(layers))
@@ -104,6 +121,7 @@ class HYV4Config(PretrainedConfig):
             gated_mla=True,
             gating_type="elementwise",
             learnable_sink=True,
+            enable_lm_head_fp32=True,
             rms_norm_eps=1e-5,
             hidden_act="silu",
             attention_bias=False,

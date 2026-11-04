@@ -4,7 +4,7 @@
 """Explicit A5 SFA precision/replay smoke test, without private model weights.
 
 Run as a script on the serving host; failure is fatal, never a fallback/skip:
-python tests/e2e/singlecard/test_hy_dflash_sfa.py --heads 16
+python tests/e2e/singlecard/test_hy_dflash_sfa.py --heads 8 --nope-dim 192 --value-dim 256
 """
 
 import argparse
@@ -17,12 +17,12 @@ import torch
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--heads", type=int, default=16, help="Local query heads after TP sharding")
+    parser.add_argument("--heads", type=int, default=8, help="Local query heads after TP sharding")
     parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--context-capacity", type=int, default=2056)
     parser.add_argument("--queries", type=int, default=8)
-    parser.add_argument("--nope-dim", type=int, default=128)
-    parser.add_argument("--value-dim", type=int, default=128)
+    parser.add_argument("--nope-dim", type=int, default=192)
+    parser.add_argument("--value-dim", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=50)
     args = parser.parse_args()
     if (
@@ -34,7 +34,16 @@ def main():
     # Worker isolation: load NPU/vLLM only for this explicit hardware check.
     import torch_npu
 
-    from vllm_ascend.attention.hy_dflash import HYContext, absorbed_mla, get_hy_sfa_op, sfa_absorbed_mla
+    from vllm_ascend.attention.hy_dflash import (
+        HYContext,
+        HYTargetLayerState,
+        absorbed_mla,
+        get_hy_sfa_op,
+        make_paged_context,
+        paged_sfa_absorbed_mla,
+        sfa_absorbed_mla,
+        update_paged_context,
+    )
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
     assert get_ascend_device_type() == AscendDeviceType.A5, "This test requires an A5 build/device"
@@ -58,11 +67,35 @@ def main():
     )
     scale = (args.nope_dim + 64) ** -0.5
     results = []
+    block_size = 16
+    columns = max(1, (c + block_size - 1) // block_size)
+    target_blocks = b * columns
+    total_blocks = target_blocks + b * ((q + block_size - 1) // block_size)
+    paged = make_paged_context(
+        61,
+        random(total_blocks, block_size, 1, 512),
+        random(total_blocks, block_size, 1, 64),
+        target_blocks=target_blocks,
+        table_columns=columns,
+        batch=b,
+        capacity=c,
+        query_len=q,
+    )
+    table = torch.arange(target_blocks, device="npu", dtype=torch.int32).view(b, columns)
+    layer = HYTargetLayerState(61, paged.cache, table, context.indices, paged.rope_cache)
 
-    for with_sink in (False, True):
+    def update_pages():
+        paged.cache[:target_blocks].view(b, -1, 512)[:, :c].copy_(context.kv[..., :512])
+        paged.rope_cache[:target_blocks].view(b, -1, 64)[:, :c].copy_(context.kv[..., 512:])
+        update_paged_context(paged, layer, context.indices.masked_fill(~context.valid, -1))
+
+    for layout, with_sink in ((layout, sink) for layout in ("gather", "paged") for sink in (False, True)):
         sinks = torch.linspace(-2, 3, h, device="npu") if with_sink else None
+        update_pages()
 
-        def run(sinks=sinks):
+        def run(sinks=sinks, layout=layout):
+            if layout == "paged":
+                return paged_sfa_absorbed_mla(query, query_rope, latent, rope, paged, ku, vu, scale, sinks, sfa_op=op)
             return sfa_absorbed_mla(query, query_rope, latent, rope, context, ku, vu, scale, sinks, sfa_op=op)
 
         def reference(sinks=sinks):
@@ -99,13 +132,18 @@ def main():
             context.kv.copy_(context.kv.roll(1, dims=0))
             query.copy_(query.roll(1, dims=0))
             latent.copy_(latent.roll(1, dims=1))
+            update_pages()
+            history = paged.cache[:target_blocks].clone(), paged.rope_cache[:target_blocks].clone()
             graph.replay()
             actual = captured.cpu().float()
             expected = reference().float()
             torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.02)
             torch.testing.assert_close(actual, run().cpu().float(), rtol=0.005, atol=0.005)
+            torch.testing.assert_close(paged.cache[:target_blocks], history[0], rtol=0, atol=0)
+            torch.testing.assert_close(paged.rope_cache[:target_blocks], history[1], rtol=0, atol=0)
             max_error = max(max_error, (actual - expected).abs().max().item())
         context.valid.fill_(True)
+        update_pages()
         graph.replay()
         first_query = captured[:, 0].clone()
         latent[:, 1:] += 10
@@ -122,7 +160,10 @@ def main():
         torch.npu.synchronize()
         results.append(
             dict(
-                sink=with_sink, max_abs_error=max_error, graph_ms=(time.perf_counter() - started) * 1000 / args.repeats
+                layout=layout,
+                sink=with_sink,
+                max_abs_error=max_error,
+                graph_ms=(time.perf_counter() - started) * 1000 / args.repeats,
             )
         )
     print(json.dumps(dict(torch_npu=torch_npu.__version__, dimensions=vars(args), results=results), indent=2))

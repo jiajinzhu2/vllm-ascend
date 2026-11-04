@@ -7,7 +7,7 @@ The A5 path uses native SFA; the PyTorch path remains a numerical reference.
 Logical document/token positions are deliberately separate from 3-D M-RoPE.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -162,6 +162,156 @@ class HYContext:
     indices: torch.Tensor  # [batch, capacity], -1 padding
     kv: torch.Tensor  # gathered latent + already-rotated rope key
     valid: torch.Tensor
+
+
+@dataclass(frozen=True)
+class HYPagedContext:
+    """Live target pages plus per-batch scratch pages excluded from its allocator.
+
+    ``indices`` address the target's logical sequence. The last block-table
+    columns map an artificial logical suffix to private scratch pages. RoPE
+    still uses the true positions; that suffix never becomes accepted history.
+    """
+
+    layer_id: int
+    indices: torch.Tensor
+    valid: torch.Tensor
+    cache: torch.Tensor
+    rope_cache: torch.Tensor
+    block_table: torch.Tensor
+    block_slots: torch.Tensor
+    block_positions: torch.Tensor
+    seq_lens: torch.Tensor
+    target_columns: int
+    target_blocks: int
+
+
+def slice_hy_context(context, batch):
+    if isinstance(context, HYPagedContext):
+        return replace(
+            context,
+            indices=context.indices[:batch],
+            valid=context.valid[:batch],
+            block_table=context.block_table[:batch],
+            block_slots=context.block_slots[:batch],
+            block_positions=context.block_positions[:batch],
+            seq_lens=context.seq_lens[:batch],
+        )
+    return HYContext(context.layer_id, context.indices[:batch], context.kv[:batch], context.valid[:batch])
+
+
+def make_paged_context(layer_id, cache, rope_cache, *, target_blocks, table_columns, batch, capacity, query_len):
+    """Bind once after cache allocation; never concatenate/copy the target pool."""
+    if (
+        cache.ndim != 4
+        or rope_cache.ndim != 4
+        or cache.shape[-2:] != (1, SFA_LATENT_DIM)
+        or rope_cache.shape != (*cache.shape[:-1], SFA_ROPE_DIM)
+        or cache.dtype != torch.bfloat16
+        or rope_cache.dtype != torch.bfloat16
+    ):
+        raise ValueError("HY paged SFA requires separate BF16 [blocks, block_size, 1, 512/64] caches")
+    block_size = cache.shape[1]
+    if not 16 <= block_size <= 1024 or block_size % 16:
+        raise ValueError("HY paged SFA block size must be a multiple of 16 in [16, 1024]")
+    if min(batch, table_columns, query_len) <= 0 or capacity < 0:
+        raise ValueError("HY paged SFA requires positive batch/table/query dimensions and nonnegative capacity")
+    per_request = (query_len + block_size - 1) // block_size
+    if target_blocks <= 0 or target_blocks + batch * per_request > cache.shape[0]:
+        raise ValueError("HY target KV allocation has insufficient/aligned private scratch pages")
+    device = cache.device
+    scratch = target_blocks + torch.arange(batch * per_request, device=device).view(batch, per_request)
+    table = torch.zeros((batch, table_columns + per_request), dtype=torch.int32, device=device)
+    table[:, table_columns:].copy_(scratch)
+    offsets = torch.arange(query_len, device=device)
+    slots = scratch[:, offsets // block_size] * block_size + offsets % block_size
+    positions = (table_columns * block_size + offsets).expand(batch, -1)
+    indices = torch.full((batch, capacity), -1, dtype=torch.int64, device=device)
+    lengths = torch.full((batch,), table_columns * block_size + query_len, dtype=torch.int32, device=device)
+    return HYPagedContext(
+        layer_id,
+        indices,
+        indices >= 0,
+        cache,
+        rope_cache,
+        table,
+        slots,
+        positions,
+        lengths,
+        table_columns,
+        target_blocks,
+    )
+
+
+def update_paged_context(destination, layer, indices):
+    """Validate outside capture; update metadata only, leaving historical KV read-only."""
+    batch = indices.shape[0]
+    if (
+        batch > destination.indices.shape[0]
+        or indices.shape[1:] != destination.indices.shape[1:]
+        or layer.cache.data_ptr() != destination.cache.data_ptr()
+        or layer.rope_cache is None
+        or layer.rope_cache.data_ptr() != destination.rope_cache.data_ptr()
+        or layer.block_table.shape != (batch, destination.target_columns)
+    ):
+        raise ValueError("HY target paged-cache topology changed after binding")
+    logical = indices.clamp_min(0) // layer.cache.shape[1]
+    physical = layer.block_table.long().gather(1, logical.clamp_max(destination.target_columns - 1))
+    valid = indices >= 0
+    allocated = (logical < destination.target_columns) & (physical >= 0) & (physical < destination.target_blocks)
+    if not torch.equal(valid & allocated, valid):
+        raise ValueError("HY selected context is outside the target's historical KV pool")
+    destination.indices.fill_(-1)
+    destination.indices[:batch].copy_(indices)
+    destination.valid.zero_()
+    destination.valid[:batch].copy_(valid)
+    destination.block_table[:, : destination.target_columns].zero_()
+    # The artificial suffix makes the logical length span unused history
+    # columns too. Keep their physical IDs in range even though sparse_indices
+    # never selects them; stale/unallocated table entries are not valid pages.
+    table = layer.block_table.masked_fill((layer.block_table < 0) | (layer.block_table >= destination.target_blocks), 0)
+    destination.block_table[:batch, : destination.target_columns].copy_(table)
+
+
+def paged_sfa_absorbed_mla(
+    query_nope, query_rope, block_latent, block_rope, context, key_up, value_up, scale, sinks, *, sfa_op
+):
+    """Write only reserved current-block slots and attend directly to target pages."""
+    batch, query_len = query_nope.shape[:2]
+    if any(t.dtype != torch.bfloat16 for t in (query_nope, query_rope, block_latent, block_rope, key_up, value_up)):
+        raise ValueError("HY paged SFA requires BF16 draft projections")
+    keys = block_latent.reshape(-1, 1, SFA_LATENT_DIM).contiguous()
+    rope = block_rope.reshape(-1, 1, SFA_ROPE_DIM).contiguous()
+    slots = context.block_slots.reshape(-1)
+    if keys.device.type == "npu":
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        DeviceOperator.reshape_and_cache(keys, rope, context.cache, context.rope_cache, slots)
+    else:
+        # Portable oracle only. NPU uses the native cache writer above.
+        context.cache.flatten(0, 1).index_copy_(0, slots, keys)
+        context.rope_cache.flatten(0, 1).index_copy_(0, slots, rope)
+    packed = hy_sfa_indices(context.valid, query_len)
+    logical = torch.cat((context.indices, context.block_positions), dim=-1)
+    logical = logical[:, None, None, :].expand(batch, query_len, 1, -1)
+    selected = logical.gather(-1, packed.clamp_min(0).long()).masked_fill(packed < 0, -1).int()
+    kwargs = dict(
+        block_table=context.block_table,
+        actual_seq_lengths_kv=context.seq_lens,
+        query_rope=query_rope.contiguous(),
+        key_rope=context.rope_cache,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="PA_BSND",
+        sparse_mode=0,
+        attention_mode=2,
+        return_softmax_lse=False,
+    )
+    if sinks is not None:
+        kwargs["sinks"] = sinks.float().contiguous()
+    query = torch.einsum("bqhd,hdr->bqhr", query_nope, key_up).contiguous()
+    result, _, _ = sfa_op(query, context.cache, context.cache, selected, scale, **kwargs)
+    return torch.einsum("bqhr,hvr->bqhv", result, value_up)
 
 
 def select_context_indices(
@@ -368,7 +518,22 @@ class HYDflashAttention(nn.Module):
         q_nope, q_rope, latent, k_rope = self.project(hidden)
         q_rope, k_rope = self.rotary(positions, q_rope, k_rope)
         sinks = getattr(getattr(self, "source_attention", None), "learnable_sink_param", None)
-        if self._sfa_op is None:
+        if isinstance(context, HYPagedContext):
+            if self._sfa_op is None:
+                raise ValueError("HY paged target KV requires the native SFA backend")
+            output = paged_sfa_absorbed_mla(
+                q_nope,
+                q_rope,
+                latent,
+                k_rope,
+                context,
+                self.key_up,
+                self.value_up,
+                self.scale,
+                sinks,
+                sfa_op=self._sfa_op,
+            )
+        elif self._sfa_op is None:
             output = absorbed_mla(
                 q_nope, q_rope, latent, k_rope, context, self.key_up, self.value_up, self.scale, sinks
             )

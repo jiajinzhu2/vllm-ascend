@@ -69,12 +69,30 @@ def harness(monkeypatch):
             if entry is None:
                 assert capture_events[-1] is True
                 inputs = self.proposer.build_model_inputs_first_pass(descriptor.num_tokens)
-                entry = SimpleNamespace(inputs=inputs, output=None)
+                entry = SimpleNamespace(
+                    inputs=inputs,
+                    output=None,
+                    confidence=None
+                    if self.proposer._confidence_buffer is None
+                    else self.proposer._confidence_buffer[: descriptor.num_reqs],
+                )
                 self.concrete_aclgraph_entries[descriptor] = entry
                 self.captured_batches.append(descriptor.num_reqs)
             hidden = self.proposer.model(**entry.inputs)
-            output = self.proposer.model.compute_logits(hidden[:, 1:].reshape(-1, self.proposer.hidden_size))
-            output = output.argmax(-1).view(descriptor.num_reqs, -1)
+            model = self.proposer.model
+            if model.correction is None:
+                output = model.compute_logits(hidden[:, 1:].reshape(-1, self.proposer.hidden_size))
+                output = output.argmax(-1).view(descriptor.num_reqs, -1)
+            else:
+                previous = entry.inputs["input_ids"][:, 0].long()
+                proposals = []
+                for step in range(7):
+                    corrected = model.correct_hidden_states(hidden[:, step + 1], previous)
+                    previous = model.compute_logits(corrected).argmax(-1)
+                    proposals.append(previous)
+                    if entry.confidence is not None:
+                        entry.confidence[:, step].copy_(model.predict_confidence(corrected).float())
+                output = torch.stack(proposals, dim=1)
             if entry.output is None:
                 entry.output = output
             else:
@@ -146,6 +164,7 @@ def harness(monkeypatch):
     config_module = load("vllm_ascend.patch.hy4_config", "vllm_ascend/patch/hy4_config.py")
     attention = load("vllm_ascend.attention.hy_dflash", "vllm_ascend/attention/hy_dflash.py")
     adapter = load("vllm_ascend.patch.worker.hy_dflash", "vllm_ascend/patch/worker/hy_dflash.py")
+    cache_module = load("vllm_ascend.patch.worker.hy_dflash_cache", "vllm_ascend/patch/worker/hy_dflash_cache.py")
     parent = load("vllm_ascend.spec_decode.dflash_proposer", "vllm_ascend/spec_decode/dflash_proposer.py")
     hy = load("vllm_ascend.spec_decode.hy_dflash_proposer", "vllm_ascend/spec_decode/hy_dflash_proposer.py")
     return SimpleNamespace(
@@ -159,6 +178,7 @@ def harness(monkeypatch):
         register=register,
         load=load,
         config_module=config_module,
+        cache_module=cache_module,
     )
 
 
@@ -949,13 +969,156 @@ def test_graph_text_axes_checked_before_capture_and_every_replay(harness, monkey
         p.prepare_context(torch.tensor([6]), None, None, None)
 
 
-def test_graph_auxiliary_heads_and_oversize_batches_rejected(harness, monkeypatch):
+def test_graph_oversize_batches_rejected(harness, monkeypatch):
     p = make_graph_proposer(harness, monkeypatch)
     with pytest.raises(ValueError, match="capacity"):
         p._graph_batch_size(5)
-    p.model.confidence_head = nn.Linear(4, 1)
-    with pytest.raises(NotImplementedError, match="auxiliary heads"):
-        p._initialize_graph_buffers()
+
+
+def test_graph_serial_heads_refresh_confidence_and_preserve_outputs(harness, monkeypatch):
+    p = make_graph_proposer(harness, monkeypatch)
+    p.model = make_model(harness)
+    p._initialize_graph_buffers()
+    p.capture_model()
+    assert p.confidence_logits is None  # dummy_run clears public diagnostics
+    buffer_address = p._confidence_buffer.data_ptr()
+    cfg = config()
+    cfg.speculative_config.draft_model_config.hf_config.dflash_config.update(context_topk=4, context_local_window=2)
+    eager = make_proposer(harness, cfg)
+    saved = None
+    for requests, lengths, anchors in (
+        (["a", "b", "a"], [5, 9, 6], [3, 4, 8]),
+        (["b", "a"], [12, 8], [6, 9]),
+        (["a"], [9], [11]),
+    ):
+        actual = graph_propose(p, requests, lengths, anchors)
+        expected = graph_propose(eager, requests, lengths, anchors)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(p.confidence_logits, eager.confidence_logits)
+        assert p.confidence_request_ids == tuple(requests)
+        assert p.confidence_logits.shape == (len(requests), 7)
+        assert p._confidence_buffer.data_ptr() == buffer_address
+        if saved is None:
+            saved = p.confidence_logits, p.confidence_logits.clone()
+    torch.testing.assert_close(*saved)
+
+
+def emulate_paged_sfa(query, key, value, indices, scale, **kwargs):
+    assert kwargs["layout_kv"] == "PA_BSND"
+    assert key.data_ptr() == value.data_ptr()
+    table = kwargs.pop("block_table").long()
+    seq_lens = kwargs.pop("actual_seq_lengths_kv")
+    assert seq_lens.dtype == torch.int32 and (seq_lens <= table.shape[1] * key.shape[1]).all()
+    packed_key = key[table].flatten(1, 2).contiguous()
+    kwargs["key_rope"] = kwargs["key_rope"][table].flatten(1, 2).contiguous()
+    kwargs["layout_kv"] = "BSND"
+    return emulate_native_sfa(query, packed_key, packed_key, indices, scale, **kwargs)
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_paged_sfa_matches_gather_and_never_writes_history(harness, with_sink):
+    a = harness.attention
+    torch.manual_seed(1104)
+    b, q, h, capacity, block_size = 3, 8, 2, 7, 16
+    cache = torch.randn(9, block_size, 1, 512).bfloat16()
+    rope = torch.randn(9, block_size, 1, 64).bfloat16()
+    saved = cache[:6].clone(), rope[:6].clone()
+    ctx = a.make_paged_context(
+        61, cache, rope, target_blocks=6, table_columns=3, batch=b, capacity=capacity, query_len=q
+    )
+    table = torch.tensor([[0, 1, 2], [-100, 99, 6], [0, 1, 5]], dtype=torch.int32)
+    indices = torch.tensor([[0, 2, 5, 19, 34, -1, -1], [-1] * capacity, [1, 7, 18, 25, 33, 40, 43]])
+    layer = a.HYTargetLayerState(61, cache, table, indices, rope)
+    a.update_paged_context(ctx, layer, indices)
+    assert ctx.block_slots.unique().numel() == b * q
+    assert not ctx.block_table[1, :3].any()  # unused history columns are safe
+    query = torch.randn(b, q, h, 192).bfloat16()
+    qr = torch.randn(b, q, h, 64).bfloat16()
+    latent, kr = torch.randn(b, q, 512).bfloat16(), torch.randn(b, q, 64).bfloat16()
+    ku, vu = (torch.randn(h, 192, 512) / 512**0.5).bfloat16(), (torch.randn(h, 256, 512) / 512**0.5).bfloat16()
+    sinks = torch.tensor([1.0, -1.0]) if with_sink else None
+    for size in (3, 1, 2):
+        # In-place request reorder and fewer active rows; old metadata is cleared.
+        rows = torch.arange(size - 1, -1, -1)
+        current = replace(layer, block_table=table[rows])
+        a.update_paged_context(ctx, current, indices[rows])
+        gathered = a.gather_context(current, indices[rows])
+        expected = a.absorbed_mla(query[:size], qr[:size], latent[:size], kr[:size], gathered, ku, vu, 1 / 16, sinks)
+        actual = a.paged_sfa_absorbed_mla(query, qr, latent, kr, ctx, ku, vu, 1 / 16, sinks, sfa_op=emulate_paged_sfa)
+        torch.testing.assert_close(actual[:size], expected, atol=0.025, rtol=0.04)
+        torch.testing.assert_close(cache[:6], saved[0], rtol=0, atol=0)
+        torch.testing.assert_close(rope[:6], saved[1], rtol=0, atol=0)
+        assert not ctx.valid[size:].any() and (ctx.indices[size:] == -1).all()
+    baseline = actual[:, 0].clone()
+    latent[:, 1:] *= 50
+    kr[:, 1:] *= 50
+    poisoned = a.paged_sfa_absorbed_mla(query, qr, latent, kr, ctx, ku, vu, 1 / 16, sinks, sfa_op=emulate_paged_sfa)
+    torch.testing.assert_close(poisoned[:, 0], baseline, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="historical KV"):
+        a.update_paged_context(ctx, replace(layer, block_table=table + 6), indices)
+
+
+def test_target_scratch_is_charged_and_excluded_from_scheduler(harness):
+    @dataclass(frozen=True)
+    class TensorSpec:
+        size: int
+        shared_by: list[str]
+
+    specs = {
+        "a": SimpleNamespace(block_size=16, page_size_bytes=1024),
+        "b": SimpleNamespace(block_size=32, page_size_bytes=2048),
+    }
+    reservation = harness.cache_module.HYDraftCacheReservation(specs, ("a", "b"), 4, 8, "cpu")
+    assert reservation.profile_buffer.numel() == 4 * (1024 + 2048)
+    original = SimpleNamespace(num_blocks=6, kv_cache_tensors=[TensorSpec(6144, ["a"]), TensorSpec(12288, ["b"])])
+    worker = SimpleNamespace(num_blocks=6, kv_cache_tensors=list(original.kv_cache_tensors))
+    reservation.extend(worker)
+    assert reservation.profile_buffer is None
+    assert original.kv_cache_tensors[0].size == 6144 and worker.kv_cache_tensors[0].size == 10240
+    assert worker.num_blocks == original.num_blocks == 6
+    assert reservation.prefix_tokens == {"a": 96, "b": 192}
+    with pytest.raises(RuntimeError, match="twice"):
+        reservation.extend(worker)
+
+
+@pytest.mark.parametrize("size,names", [(6144, ["a", "b"]), (6145, ["a"]), (6144, ["b"])])
+def test_scratch_rejects_shared_misaligned_or_missing_target_pools(harness, size, names):
+    @dataclass(frozen=True)
+    class TensorSpec:
+        size: int
+        shared_by: list[str]
+
+    reservation = harness.cache_module.HYDraftCacheReservation(
+        {"a": SimpleNamespace(block_size=16, page_size_bytes=1024)}, ("a",), 4, 8, "cpu"
+    )
+    cfg = SimpleNamespace(num_blocks=6, kv_cache_tensors=[TensorSpec(size, names)])
+    original = cfg.kv_cache_tensors
+    with pytest.raises(ValueError):
+        reservation.extend(cfg)
+    assert cfg.kv_cache_tensors is original and cfg.num_blocks == 6
+    assert reservation.profile_buffer is not None and not reservation.prefix_tokens
+
+
+@pytest.mark.parametrize(
+    "block_size,columns,batch,query_len",
+    [(0, 3, 2, 8), (17, 3, 2, 8), (1040, 3, 2, 8), (16, 0, 2, 8), (16, 3, 0, 8), (16, 3, 2, 0)],
+)
+def test_paged_context_rejects_invalid_native_dimensions(harness, block_size, columns, batch, query_len):
+    cache = torch.empty(5, block_size, 1, 512, dtype=torch.bfloat16)
+    rope = torch.empty(5, block_size, 1, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        harness.attention.make_paged_context(
+            61, cache, rope, target_blocks=3, table_columns=columns, batch=batch, capacity=8, query_len=query_len
+        )
+
+
+def test_prefill_only_producer_cannot_enable_dflash(harness):
+    cfg = config()
+    cfg.kv_transfer_config = SimpleNamespace(is_kv_producer=True, is_kv_consumer=False)
+    with pytest.raises(ValueError, match="prefill-only"):
+        make_proposer(harness, cfg)
+    cfg.kv_transfer_config = SimpleNamespace(is_kv_producer=False, is_kv_consumer=True)
+    make_proposer(harness, cfg)  # Configuration only; does not validate PD transport.
 
 
 @pytest.mark.parametrize("draft_graph", [False, True])
@@ -1394,7 +1557,12 @@ def checkpoint_model(harness):
         "vllm.distributed", get_tensor_model_parallel_rank=lambda: 0, get_tensor_model_parallel_world_size=lambda: 1
     )
     harness.register("vllm.model_executor.layers.layernorm", RMSNorm=nn.RMSNorm)
-    harness.register("vllm.model_executor.layers.linear", ReplicatedLinear=Linear)
+    harness.register(
+        "vllm.model_executor.layers.linear",
+        ReplicatedLinear=Linear,
+        ColumnParallelLinear=Linear,
+        RowParallelLinear=Linear,
+    )
     harness.register(
         "vllm.model_executor.layers.vocab_parallel_embedding",
         VocabParallelEmbedding=Embedding,
@@ -1440,8 +1608,11 @@ def checkpoint_model(harness):
     return model, weights
 
 
-def test_checkpoint_loads_bf16_backbone_and_shares_optional_modules(harness, checkpoint_model):
+@pytest.mark.parametrize("redundant_head", [False, True])
+def test_checkpoint_loads_bf16_backbone_and_shares_optional_modules(harness, checkpoint_model, redundant_head):
     model, weights = checkpoint_model
+    if redundant_head:
+        weights.append(("lm_head.weight", torch.randn_like(model.lm_head.weight)))
     model.load_weights(iter(weights))
     embed, head = nn.Embedding(19, 4).to(torch.bfloat16), nn.Linear(4, 19).to(torch.bfloat16)
     target = SimpleNamespace(
@@ -1452,8 +1623,9 @@ def test_checkpoint_loads_bf16_backbone_and_shares_optional_modules(harness, che
         get_hy_dflash_attention=lambda _: SimpleNamespace(kv_lora_rank=3, qk_rope_head_dim=6),
     )
     adapter = model.to_hy_dflash_adapter(target)
+    assert model.lm_head is head and adapter.logits_callback is target.compute_logits
     assert adapter.embed_tokens is embed
-    assert adapter.correction is None and adapter.confidence_head is None
+    assert adapter.correction is not None and adapter.confidence_head is not None
     assert adapter.target_layer_ids == (61, 65, 69, 73, 77)
     assert all(p.dtype == torch.bfloat16 for p in model.parameters())
     hidden = adapter(
@@ -1470,6 +1642,76 @@ def test_missing_trained_fusion_gate_is_not_randomly_initialized(checkpoint_mode
     model, weights = checkpoint_model
     with pytest.raises(ValueError, match="model.fusion.gate"):
         model.load_weights((name, weight) for name, weight in weights if name != "model.fusion.gate")
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "model.correction.gate_proj.weight",
+        "model.correction.hidden_norm.weight",
+        "model.confidence_head.weight",
+        "model.confidence_head.bias",
+    ],
+)
+def test_missing_trained_auxiliary_head_is_fatal(checkpoint_model, missing):
+    model, weights = checkpoint_model
+    with pytest.raises(ValueError, match=missing):
+        model.load_weights((name, value) for name, value in weights if name != missing)
+
+
+def test_new_checkpoint_defaults_and_explicit_legacy_config(harness):
+    cls = harness.config_module.HYDflashConfig
+    options = dict(architectures=["hy4dflymodels"], num_hidden_layers=5, target_layer_ids=[61, 65, 69, 73, 77])
+    cfg = cls(**options)
+    assert cfg.dflash_config["use_hidden_correction"] and cfg.dflash_config["use_confidence_head"]
+    legacy = cls(**options, use_hidden_correction=False, use_confidence_head=False)
+    assert not legacy.dflash_config["use_hidden_correction"]
+    for invalid in (
+        dict(use_hidden_correction=False, use_confidence_head=True),
+        dict(use_markov_head=False, use_hidden_correction=True),
+        dict(use_hidden_correction="false"),
+    ):
+        with pytest.raises(ValueError):
+            cls(**options, **invalid)
+
+
+def test_target_fp32_logits_avoid_bf16_rounding(harness):
+    source = harness.root / "vllm_ascend/models/hy_v4.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if getattr(n, "name", "") == "AscendHYV4ForCausalLM")
+    method = next(n for n in cls.body if getattr(n, "name", "") == "compute_logits")
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    hidden = torch.tensor([[1, 1]], dtype=torch.bfloat16)
+    weight = torch.tensor([[1.0, 0.0], [1.0, 0.001]], dtype=torch.float32)
+    target = SimpleNamespace(
+        enable_lm_head_fp32=True, lm_head=weight, logits_processor=lambda w, h: h @ w.T, config=SimpleNamespace()
+    )
+    logits = namespace["compute_logits"](target, hidden)
+    assert logits.dtype == torch.float32 and logits.argmax(-1).item() == 1
+    assert logits.bfloat16().argmax(-1).item() == 0  # regression: rounding changes the token
+
+
+def test_paged_binding_preserves_group_and_separate_layer_snapshots(harness):
+    p = make_proposer(harness)
+    p.attn_layer_names = p._target_model.get_hy_dflash_layer_names(p.target_layer_ids)
+    cfg = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=[name]) for name in p.attn_layer_names])
+    tables = [torch.zeros(4, 3, dtype=torch.int32) for _ in p.attn_layer_names]
+    p.runner.input_batch.block_table = [SimpleNamespace(get_device_tensor=lambda t=t: t) for t in tables]
+    pages = {
+        layer_id: (torch.zeros(10, 16, 1, 512, dtype=torch.bfloat16), torch.zeros(10, 16, 1, 64, dtype=torch.bfloat16))
+        for layer_id in p.target_layer_ids
+    }
+    p._target_model.get_hy_dflash_attention = lambda layer_id: SimpleNamespace(
+        mla_attn=SimpleNamespace(mla_attn=SimpleNamespace(kv_cache=pages[layer_id]))
+    )
+    p._cache_reservation = SimpleNamespace(prefix_tokens={name: 6 * 16 for name in p.attn_layer_names})
+    p.initialize_attn_backend(cfg)
+    assert len(p._paged_contexts) == 5
+    for ctx, layer_id in zip(p._paged_contexts, p.target_layer_ids):
+        assert ctx.cache is pages[layer_id][0]
+        assert ctx.block_slots.min() == 96 and ctx.block_slots.unique().numel() == 32
+        assert ctx.target_blocks == 6 and ctx.block_table.shape == (4, 4)
 
 
 def test_draft_does_not_cast_quantized_weight_bytes_to_bf16(checkpoint_model):

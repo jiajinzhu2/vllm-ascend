@@ -595,17 +595,22 @@ class AscendHYV4ForCausalLM(
         if self.quant_config is not None:
             self.quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.model = HYV4Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.enable_lm_head_fp32 = bool(getattr(self.config, "enable_lm_head_fp32", False))
         self.lm_head = (
             ParallelLMHead(
                 self.config.vocab_size,
                 self.config.hidden_size,
-                quant_config=self.quant_config,
+                # 0.20.2 has no head_dtype accumulation API. Keep this one
+                # sharded weight in FP32, once, instead of rounding logits to
+                # BF16 or recasting the entire head at each of seven steps.
+                quant_config=None if self.enable_lm_head_fp32 else self.quant_config,
+                params_dtype=torch.float32 if self.enable_lm_head_fp32 else None,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if get_pp_group().is_last_rank
             else PPMissingLayer()
         )
-        if get_pp_group().is_last_rank and self.config.tie_word_embeddings:
+        if get_pp_group().is_last_rank and self.config.tie_word_embeddings and not self.enable_lm_head_fp32:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
@@ -639,6 +644,8 @@ class AscendHYV4ForCausalLM(
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if self.enable_lm_head_fp32:
+            hidden_states = hidden_states.float()
         logits = self.logits_processor(self.lm_head, hidden_states)
         if getattr(self.config, "soft_logits_capping", False):
             soft_cap = self.config.soft_logits_capping_logits
@@ -725,6 +732,12 @@ class AscendHYV4ForCausalLM(
         heads_per_rank = self.config.num_attention_heads // get_tensor_model_parallel_world_size()
 
         for name, weight in weights:
+            if (
+                name == "lm_head.weight"
+                and self.enable_lm_head_fp32
+                and weight.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+            ):
+                raise ValueError("HY FP32 LM head requires an unquantized checkpoint head weight")
             if name.startswith("model.mtp_layers."):
                 continue
             if ".indexer." in name:
@@ -799,6 +812,9 @@ class AscendHYV4ForCausalLM(
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, weight)
             loaded.add(name)
+        if get_pp_group().is_last_rank and self.config.tie_word_embeddings and self.enable_lm_head_fp32:
+            self.lm_head.weight.data.copy_(self.model.embed_tokens.weight)
+            loaded.add("lm_head.weight")
         return loaded
 
 

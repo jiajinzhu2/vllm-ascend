@@ -83,8 +83,8 @@ class HYDflashAdapter(nn.Module):
     The target supplies embeddings/LM head through the checkpoint's normal
     sharing policy. final_hidden is already target-final-normalized. The fusion
     hidden_norm is the *additional* normalization in the specified MTP formula.
-    HY4DflyModels uses neither correction nor confidence. The optional modules
-    preserve the separate adapter contract for checkpoints that contain them.
+    The 1104 checkpoint has correction and confidence. Older checkpoints may
+    explicitly omit both; never synthesize untrained heads for those weights.
     """
 
     hy_dflash_contract_version = 2

@@ -19,15 +19,19 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.hy_dflash import (
-    HYContext,
+    HYPagedContext,
     HYTargetLayerState,
     HYTargetState,
     gather_context,
+    make_paged_context,
     select_context_indices,
+    slice_hy_context,
+    update_paged_context,
 )
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.patch.hy4_config import get_hy_dflash_config
 from vllm_ascend.patch.worker.hy_dflash import HYDflashAdapter
+from vllm_ascend.patch.worker.hy_dflash_cache import HYDraftCacheReservation
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.utils import lmhead_tp_enable
 
@@ -72,6 +76,8 @@ class AscendHYDflashProposer(AscendDflashProposer):
             sorted({self.max_batch_size, *(1 << i for i in range(self.max_batch_size.bit_length()))})
         )
         self._graph_contexts = ()
+        self._paged_contexts = ()
+        self._cache_reservation = None
         self._graphs_captured = False
         self.graph_replay_count = 0
         rope = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
@@ -83,6 +89,9 @@ class AscendHYDflashProposer(AscendDflashProposer):
         # layouts need additional cache/row-mapping integration.
         # Check capabilities once; model dimensions belong to the checkpoint.
         spec = vllm_config.speculative_config
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        if transfer is not None and transfer.is_kv_producer and not transfer.is_kv_consumer:
+            raise ValueError("HY prefill-only producers must start without speculative-config; enable DFlash on decode")
         unsupported = [
             name
             for name in (
@@ -179,12 +188,34 @@ class AscendHYDflashProposer(AscendDflashProposer):
             raise ValueError("HY draft dimensions and target KV layer mapping must match the model configuration")
         self._draft_attn_layer_names = set()
         self.draft_attn_groups = []
+        options = get_hy_dflash_config(self.speculative_config.draft_model_config.hf_config)
+        all_sfa = all(layer.attention.attention_backend == "sfa" for layer in draft.layers)
+        layout = options["ascend_kv_layout"]
+        if layout == "paged" and not all_sfa:
+            raise ValueError("HY paged KV layout requires SFA on all draft layers")
+        if layout == "paged" or (layout == "auto" and all_sfa):
+            self._cache_reservation = HYDraftCacheReservation(
+                self.runner.get_kv_cache_spec(),
+                self.attn_layer_names,
+                self.max_batch_size,
+                self.query_block_size,
+                self.device,
+            )
+        logger.info(
+            "HY DFlash KV layout: %s; correction=%s confidence=%s",
+            "paged" if self._cache_reservation is not None else "gather",
+            draft.correction is not None,
+            draft.confidence_head is not None,
+        )
         if self.use_cuda_graph:
             self._initialize_graph_buffers()
 
+    def reserve_target_kv_scratch(self, kv_cache_config):
+        """Called on the runner's private config before target cache allocation."""
+        if self._cache_reservation is not None:
+            self._cache_reservation.extend(kv_cache_config)
+
     def _initialize_graph_buffers(self) -> None:
-        if self.model.correction is not None or self.model.confidence_head is not None:
-            raise NotImplementedError("HY draft graphs require the checkpoint without auxiliary heads")
         # Allocate before memory profiling. Every bucket uses views of these
         # buffers, including profiling, capture and subsequent request batches.
         self._graph_contexts = self.model.dummy_contexts(
@@ -192,6 +223,11 @@ class AscendHYDflashProposer(AscendDflashProposer):
         )
         self._graph_target_hidden = torch.zeros(
             (self.max_batch_size, self.hidden_size), dtype=self.dtype, device=self.device
+        )
+        self._confidence_buffer = (
+            torch.zeros((self.max_batch_size, self.query_block_size - 1), dtype=torch.float32, device=self.device)
+            if self.model.confidence_head is not None
+            else None
         )
         self._runnable = ACLGraphWrapper(
             self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL, use_eagle=True
@@ -203,10 +239,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
         return next(size for size in self.graph_batch_sizes if size >= batch)
 
     def _select_graph_buffers(self, batch: int) -> None:
-        self._contexts = tuple(
-            HYContext(context.layer_id, context.indices[:batch], context.kv[:batch], context.valid[:batch])
-            for context in self._graph_contexts
-        )
+        self._contexts = tuple(slice_hy_context(context, batch) for context in self._graph_contexts)
         self._target_final_hidden = self._graph_target_hidden[:batch]
 
     def _graph_descriptor(self, batch: int) -> BatchDescriptor:
@@ -249,6 +282,32 @@ class AscendHYDflashProposer(AscendDflashProposer):
         }
         self.target_kv_cache_group_ids = tuple(layer_groups[name] for name in self.attn_layer_names)
         self.kv_cache_gid = self.target_kv_cache_group_ids[0]
+        if self._cache_reservation is not None:
+            contexts = []
+            for layer_id, name, gid in zip(
+                self.target_layer_ids, self.attn_layer_names, self.target_kv_cache_group_ids, strict=True
+            ):
+                pages = self._target_model.get_hy_dflash_attention(layer_id).mla_attn.mla_attn.kv_cache
+                prefix_tokens = self._cache_reservation.prefix_tokens[name]
+                if prefix_tokens % pages[0].shape[1]:
+                    raise ValueError("HY scratch boundary does not align with kernel KV blocks")
+                columns = self.runner.input_batch.block_table[gid].get_device_tensor().shape[1]
+                contexts.append(
+                    make_paged_context(
+                        layer_id,
+                        pages[0],
+                        pages[1],
+                        target_blocks=prefix_tokens // pages[0].shape[1],
+                        table_columns=columns,
+                        batch=self.max_batch_size,
+                        capacity=self.context_topk + self.context_local_window,
+                        query_len=self.query_block_size,
+                    )
+                )
+            self._paged_contexts = tuple(contexts)
+            if self.use_cuda_graph:
+                # Binding happens before warmup/capture, never during replay.
+                self._graph_contexts = self._paged_contexts
 
     def _target_state_from_main_model(
         self,
@@ -304,7 +363,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
         target_hidden_states: torch.Tensor,
         token_indices_to_sample: torch.Tensor,
     ) -> None:
-        """Gather each target layer's anchor-1 selection without KV writes."""
+        """Select each target layer's anchor-1 context; no history writes."""
         batch = anchor_positions.shape[0]
         request_ids = tuple(self.runner.input_batch.req_ids[:batch])
         if hasattr(self._target_model, "get_hy_dflash_attention"):
@@ -324,7 +383,7 @@ class AscendHYDflashProposer(AscendDflashProposer):
         if tuple(layer.layer_id for layer in state.layers) != self.target_layer_ids:
             raise ValueError("Target context is not in the configured draft layer order")
         contexts = []
-        for layer in state.layers:
+        for index, layer in enumerate(state.layers):
             indices = select_context_indices(
                 layer.topk_indices,
                 anchor_positions,
@@ -332,7 +391,12 @@ class AscendHYDflashProposer(AscendDflashProposer):
                 topk=self.context_topk,
                 local_window=self.context_local_window,
             )
-            contexts.append(gather_context(layer, indices))
+            if self._paged_contexts:
+                destination = self._paged_contexts[index]
+                update_paged_context(destination, layer, indices)
+                contexts.append(slice_hy_context(destination, batch))
+            else:
+                contexts.append(gather_context(layer, indices))
         if self.use_cuda_graph:
             # Validate outside capture: torch.equal synchronizes with the host.
             # Text-only RoPE then receives a 1-D view, avoiding that check in
@@ -344,6 +408,8 @@ class AscendHYDflashProposer(AscendDflashProposer):
             padded = self._graph_batch_size(batch)
             self._select_graph_buffers(padded)
             for destination, source in zip(self._contexts, contexts, strict=True):
+                if isinstance(destination, HYPagedContext):
+                    continue  # already refreshed in place above, including padding
                 destination.indices[:batch].copy_(source.indices)
                 destination.kv[:batch].copy_(source.kv)
                 destination.valid[:batch].copy_(source.valid)
@@ -417,7 +483,9 @@ class AscendHYDflashProposer(AscendDflashProposer):
         query.positions_cpu = None
         query.causal = True
         query.slot_mapping = self._slot_mapping_buffer[:num_tokens]
-        query.slot_mapping.fill_(-1)  # transient block KV; NEVER write target slots
+        # The generic writer is disabled. Paged SFA writes only its reserved
+        # suffix slots, never scheduler-owned target history/lookahead slots.
+        query.slot_mapping.fill_(-1)
         query.seq_lens_cpu = query._seq_lens_cpu = None
         query.num_computed_tokens_cpu = query._num_computed_tokens_cpu = None
         query._num_computed_tokens_cache = None
@@ -489,6 +557,9 @@ class AscendHYDflashProposer(AscendDflashProposer):
             )
         if self.use_cuda_graph:
             self.graph_replay_count += 1
+            self.confidence_logits = (
+                self._confidence_buffer[:batch].clone() if self._confidence_buffer is not None else None
+            )
             # Replaying the same graph overwrites its output allocation. The
             # scheduler/rejection sampler owns the returned proposals instead.
             return output[:batch].clone()
@@ -515,7 +586,13 @@ class AscendHYDflashProposer(AscendDflashProposer):
             self.confidence_logits = None
             return self.commit_draft_probs(logits.argmax(dim=-1).view(batch_size, -1))
         ids = torch.empty((batch_size, self.query_block_size - 1), dtype=torch.int64, device=self.device)
-        confidence = torch.empty_like(ids, dtype=torch.float32) if self.model.confidence_head is not None else None
+        confidence = None
+        if self.model.confidence_head is not None:
+            confidence = (
+                self._confidence_buffer[:batch_size]
+                if self.use_cuda_graph
+                else torch.empty_like(ids, dtype=torch.float32)
+            )
         previous_ids = self.input_ids[: num_tokens : self.query_block_size].long()
         for step in range(self.query_block_size - 1):
             corrected = self.model.correct_hidden_states(hidden[:, step + 1], previous_ids)
@@ -551,8 +628,9 @@ class AscendHYDflashProposer(AscendDflashProposer):
     ) -> None:
         if num_reqs == 0:
             num_reqs = min(self.max_batch_size, max(1, num_tokens // self.query_block_size))
-        # No live target read/write and no context projection. Allocate worst-case
-        # gathered context for memory profiling, even though all entries are masked.
+        # No live target history access or context projection. Before target
+        # allocation, gathered dummy context provides a profiling upper bound;
+        # after binding, capture may write only private paged scratch slots.
         mode = CUDAGraphMode.NONE
         descriptor = None
         if self.use_cuda_graph:
@@ -560,8 +638,11 @@ class AscendHYDflashProposer(AscendDflashProposer):
             self._select_graph_buffers(num_reqs)
             for context in self._contexts:
                 context.indices.fill_(-1)
-                context.kv.zero_()
                 context.valid.zero_()
+                if isinstance(context, HYPagedContext):
+                    context.block_table[:, : context.target_columns].zero_()
+                else:
+                    context.kv.zero_()
             self._target_final_hidden.zero_()
             if not is_profile and aclgraph_runtime_mode == CUDAGraphMode.FULL:
                 mode = CUDAGraphMode.FULL

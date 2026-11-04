@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -23,7 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_ascend.models.deepseek_v4 import DeepseekV2MLP
 from vllm_ascend.models.hy_v4 import HYV4MLAAttention
 from vllm_ascend.patch.hy4_config import get_hy_dflash_config
-from vllm_ascend.patch.worker.hy_dflash import HYDflashAdapter, HYMTPFusion
+from vllm_ascend.patch.worker.hy_dflash import HYDflashAdapter, HYHiddenCorrection, HYMTPFusion
 
 
 class HYDflashDenseLayer(nn.Module):
@@ -38,7 +38,7 @@ class HYDflashDenseLayer(nn.Module):
 
 
 class HY4DflyModels(nn.Module):
-    """Dense causal DFlash, slot-0 fusion, full vocabulary, no auxiliary heads.
+    """Dense causal DFlash with trained slot-0 fusion and optional output heads.
 
     Supported canonical checkpoint keys are documented in hy_dflash_prototype.md.
     ``dflash_config.weight_name_mapping`` can explicitly translate vendor keys;
@@ -60,9 +60,6 @@ class HY4DflyModels(nn.Module):
             raise ValueError("This HY4DflyModels adapter expects the five-layer dense checkpoint")
         if not options.get("mtp_fusion_slot0", True):
             raise ValueError("This checkpoint adapter requires slot-0 MTP fusion")
-        for flag in ("use_markov_head", "use_confidence_head", "use_hidden_correction"):
-            if getattr(config, flag, False) or options.get(flag, False):
-                raise ValueError(f"This HY4DflyModels checkpoint does not implement {flag}")
         config.layer_types = ["sparse_attention"] * config.num_hidden_layers
         config.indexer_types = ["full"] * config.num_hidden_layers
         config.hidden_act = getattr(config, "hidden_act", "silu")
@@ -92,6 +89,30 @@ class HY4DflyModels(nn.Module):
             prefix=f"{model_prefix}.fusion.eh_proj",
         )
         self.model.fusion.gate = nn.Parameter(torch.empty(config.hidden_size))
+        self.model.correction = None
+        if options["use_hidden_correction"]:
+            # TP splits the intermediate channels; down_proj reduces exactly
+            # once per step. This MLP is dense and never uses the target MoE.
+            width = config.hidden_size
+            correction_prefix = f"{model_prefix}.correction"
+            self.model.correction = HYHiddenCorrection(
+                RMSNorm(width, eps=config.rms_norm_eps),
+                RMSNorm(width, eps=config.rms_norm_eps),
+                ColumnParallelLinear(
+                    2 * width, width, bias=False, quant_config=None, prefix=f"{correction_prefix}.gate_proj"
+                ),
+                ColumnParallelLinear(
+                    2 * width, width, bias=False, quant_config=None, prefix=f"{correction_prefix}.up_proj"
+                ),
+                RowParallelLinear(width, width, bias=False, quant_config=None, prefix=f"{correction_prefix}.down_proj"),
+            )
+        self.model.confidence_head = (
+            ReplicatedLinear(
+                config.hidden_size, 1, bias=True, quant_config=None, prefix=f"{model_prefix}.confidence_head"
+            )
+            if options["use_confidence_head"]
+            else None
+        )
         # These may be replaced by target modules after strict backbone loading.
         self.model.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{model_prefix}.embed_tokens"
@@ -133,8 +154,10 @@ class HY4DflyModels(nn.Module):
                 raise ValueError("HY target/draft latent KV and RoPE dimensions must match")
         if not self._has_embedding:
             self.model.embed_tokens = target_model.model.embed_tokens
-        if not self._has_lm_head:
-            self.lm_head = target_model.lm_head
+        # The 1104 contract always uses the target head, including its FP32
+        # projection/capping. A redundant checkpoint copy must not select a
+        # different BF16 logits path just because its key happens to exist.
+        self.lm_head = target_model.lm_head
         fusion = self.model.fusion
         return HYDflashAdapter.from_hyv4_backbone(
             self.model.layers,
@@ -142,10 +165,10 @@ class HY4DflyModels(nn.Module):
             embed_tokens=self.model.embed_tokens,
             final_norm=self.model.norm,
             fusion=HYMTPFusion(fusion.embedding_norm, fusion.hidden_norm, fusion.eh_proj, fusion.gate),
-            correction=None,
-            confidence_head=None,
+            correction=self.model.correction,
+            confidence_head=self.model.confidence_head,
             # Preserve target capping/quantization semantics for the shared head.
-            compute_logits=self.compute_logits if self._has_lm_head else target_model.compute_logits,
+            compute_logits=target_model.compute_logits,
             hidden_size=self.config.hidden_size,
             target_layer_ids=options["target_kv_layers"],
         )
